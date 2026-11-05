@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/Shippunn/sanin/main/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png" alt="Sanin" width="128">
+  <img src="https://raw.githubusercontent.com/Nashon-ops/Sanin/main/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png" alt="Sanin" width="128">
   <h1 align="center">Sanin</h1>
   <p align="center">
     <strong>Anime app; — built for TV, works on phone</strong>
@@ -7,7 +7,7 @@
   <p>
     <a href="https://discord.gg/QCc5xbgbsA"><img src="https://img.shields.io/badge/Join-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
     <a href="https://t.me/+91YmT3cUqv5iNDRk"><img src="https://img.shields.io/badge/Join-Telegram-26A5E4?style=for-the-badge&logo=telegram&logoColor=white" alt="Telegram"></a>
-    <img src="https://img.shields.io/github/v/release/Shippunn/sanin?style=for-the-badge&color=2196F3&logo=github" alt="GitHub Release">
+    <img src="https://img.shields.io/github/v/release/Nashon-ops/Sanin?style=for-the-badge&color=2196F3&logo=github" alt="GitHub Release">
     <img src="https://img.shields.io/badge/Api-21+-4CAF50?style=for-the-badge&logo=android&logoColor=white" alt="Android 6+">
     <img src="https://img.shields.io/badge/TV_Optimized-Yes-FF5722?style=for-the-badge&logo=androidtv&logoColor=white" alt="TV Optimized">
   </p>
@@ -100,8 +100,8 @@ The app is a **player and tracker** — nothing more. All streaming sources come
 
 **Option A — Download directly on the TV (easiest)**
 1. Open the browser app on your TV
-2. Go to **`https://github.com/Shippun/sanin/releases/latest`**
-3. Download the latest `app-google-arm64-v8a-release.apk`
+2. Go to **`https://github.com/Nashon-ops/Sanin/releases/latest`**
+3. Download the latest `app-google-phone-arm64-v8a-release.apk`
 4. Open the download — the system package installer will handle it
 5. If the installer says **"Install blocked"**, go to TV Settings → Security → toggle **"Install unknown apps"** for your browser app
 
@@ -109,7 +109,7 @@ The app is a **player and tracker** — nothing more. All streaming sources come
 1. Download the APK on your phone from the same link above
 2. Send it to your TV using:
    - **[LocalSend](https://localsend.org)** — works on most TVs, no cable needed
-   - **ADB** — `adb connect TV_IP && adb install app-google-arm64-v8a-release.apk`
+   - **ADB** — `adb connect TV_IP && adb install app-google-phone-arm64-v8a-release.apk`
 3. Install via the package installer
 
 **Option C — App stores**
@@ -182,8 +182,8 @@ AniList/MAL API updates your progress automatically
 ## 🖥️ Building from Source
 
 ```bash
-git clone https://github.com/Shippun/sanin.git
-cd sanin
+git clone https://github.com/Nashon-ops/Sanin.git
+cd Sanin
 ./gradlew assembleGoogleRelease
 ```
 
