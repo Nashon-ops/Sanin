@@ -132,7 +132,7 @@ menuOverlay.addEventListener('click', closeMobileMenu);
 
 var pill = document.getElementById('version-pill');
 if (pill) {
-  fetch('https://api.github.com/repos/Shippun/sanin/releases/latest')
+  fetch('https://api.github.com/repos/Nashon-ops/Sanin/releases/latest')
     .then(function (r) { return r.json(); })
     .then(function (data) {
       pill.textContent = data.tag_name || 'v1.0.0';
