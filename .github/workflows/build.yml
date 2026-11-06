@@ -1,8 +1,6 @@
 name: Build Midnight
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       build_type:
@@ -28,11 +26,7 @@ jobs:
       - name: Determine build type
         id: config
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            BT="release"
-          else
-            BT="${{ github.event.inputs.build_type }}"
-          fi
+          BT="${{ github.event.inputs.build_type }}"
           echo "cap=${BT^}" >> $GITHUB_OUTPUT
           echo "build_type=$BT" >> $GITHUB_OUTPUT
           if [ "$BT" = "release" ]; then
@@ -91,7 +85,7 @@ jobs:
 
   release:
     needs: [detect, build]
-    if: needs.detect.outputs.is_release == 'true'
+    if: github.event_name == 'workflow_dispatch' && needs.detect.outputs.build_type == 'release'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
