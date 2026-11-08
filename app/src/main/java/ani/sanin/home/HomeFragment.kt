@@ -56,6 +56,7 @@ import ani.sanin.Refresh
 import ani.sanin.blurImage
 import ani.sanin.connections.anilist.Anilist
 import ani.sanin.connections.anizip.AniZip
+import ani.sanin.connections.kitsu.Kitsu
 import ani.sanin.connections.mal.MAL
 import ani.sanin.connections.anilist.AnilistHomeViewModel
 import ani.sanin.connections.anilist.getUserId
@@ -76,6 +77,7 @@ import ani.sanin.setSafeOnClickListener
 import ani.sanin.util.FocusEffectUtil
 import ani.sanin.setSlideIn
 import ani.sanin.setSlideUp
+import ani.sanin.settings.SettingsAccountActivity
 import ani.sanin.settings.SettingsDialogFragment
 import ani.sanin.settings.saving.PrefManager
 import ani.sanin.settings.saving.PrefManager.asLiveBool
@@ -110,6 +112,14 @@ class HomeFragment : Fragment() {
     private var catalogueMode = false
 
     private var catalogueJob: Job? = null
+
+    private var loggedOutMode = false
+    private var homeLoading = false
+    private var loggedOutCtaView: View? = null
+    private var loggedOutJob: Job? = null
+    private val loggedOutRowViews = mutableListOf<View>()
+    private val loggedOutRowRecyclers = mutableListOf<RecyclerView>()
+    private val loggedOutItemFocusListeners = mutableSetOf<RecyclerView>()
     override fun onCreateView(
         inflater: LayoutInflater,
         container: ViewGroup?,
@@ -124,7 +134,8 @@ class HomeFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         val scope = lifecycleScope
         catalogueMode = AnimeCatalogueHome.isCatalogueSource(AnimeCatalogueHome.savedSourceId())
-        Logger.log("HomeFragment: catalogueMode=$catalogueMode source='${AnimeCatalogueHome.savedSourceId()}'")
+        loggedOutMode = !catalogueMode && isTrackerLoggedOut()
+        Logger.log("HomeFragment: catalogueMode=$catalogueMode loggedOut=$loggedOutMode source='${AnimeCatalogueHome.savedSourceId()}'")
         fun load() {
             Logger.log("Loading HomeFragment")
             if (activity != null && _binding != null) lifecycleScope.launch(Dispatchers.Main) {
@@ -271,6 +282,7 @@ class HomeFragment : Fragment() {
             loadCatalogue()
         } else if (model.loaded) {
             load()
+            if (loggedOutMode) setupLoggedOutHome()
         }
 
         model.getListImages().observe(viewLifecycleOwner) {
@@ -290,17 +302,20 @@ class HomeFragment : Fragment() {
             more: View,
             string: String
         ) {
-            container.visibility = View.VISIBLE
-            progress.visibility = View.VISIBLE
+            container.visibility = View.GONE
+            progress.visibility = View.GONE
             recyclerView.visibility = View.GONE
             empty.visibility = View.GONE
             title.visibility = View.INVISIBLE
             more.visibility = View.INVISIBLE
 
             mode.observe(viewLifecycleOwner) {
+                if (loggedOutMode) return@observe
                 recyclerView.visibility = View.GONE
                 empty.visibility = View.GONE
                 if (it != null) {
+                    container.visibility =
+                        if (!homeLoading && it.isNotEmpty()) View.VISIBLE else View.GONE
                     if (it.isNotEmpty()) {
                         rvDataMap[recyclerView] = it
                         recyclerView.adapter = ConcatAdapter(
@@ -340,6 +355,8 @@ class HomeFragment : Fragment() {
                             LayoutAnimationController(setSlideIn(), 0.25f)
 
                     } else {
+                        recyclerView.adapter = null
+                        rvDataMap.remove(recyclerView)
                         empty.visibility = View.VISIBLE
                     }
                     more.visibility = View.VISIBLE
@@ -363,17 +380,20 @@ class HomeFragment : Fragment() {
             more: View,
             string: String
         ) {
-            container.visibility = View.VISIBLE
-            progress.visibility = View.VISIBLE
+            container.visibility = View.GONE
+            progress.visibility = View.GONE
             recyclerView.visibility = View.GONE
             empty.visibility = View.GONE
             title.visibility = View.INVISIBLE
             more.visibility = View.INVISIBLE
 
             mode.observe(viewLifecycleOwner) {
+                if (loggedOutMode) return@observe
                 recyclerView.visibility = View.GONE
                 empty.visibility = View.GONE
                 if (it != null) {
+                    container.visibility =
+                        if (!homeLoading && it.isNotEmpty()) View.VISIBLE else View.GONE
                     if (it.isNotEmpty()) {
                         rvDataMap[recyclerView] = it
                         val openMore: (View) -> Unit = { v ->
@@ -399,6 +419,8 @@ class HomeFragment : Fragment() {
                             LayoutAnimationController(setSlideIn(), 0.25f)
 
                     } else {
+                        recyclerView.adapter = null
+                        rvDataMap.remove(recyclerView)
                         empty.visibility = View.VISIBLE
                     }
                     more.visibility = View.VISIBLE
@@ -413,114 +435,121 @@ class HomeFragment : Fragment() {
 
         }
 
-        initContinueWatchingRecyclerView(
-            model.getAnimeContinue(),
-            binding.homeContinueWatchingContainer,
-            binding.homeWatchingRecyclerView,
-            binding.homeWatchingProgressBar,
-            binding.homeWatchingEmpty,
-            binding.homeContinueWatch,
-            binding.homeContinueWatchMore,
-            getString(R.string.continue_watching)
-        )
-        binding.homeWatchingBrowseButton.setOnClickListener {
-            (requireActivity() as? MainActivity)?.navPillsViewModel?.setTab(1)
-        }
-
-        initRecyclerView(
-            model.getAnimeFav(),
-            binding.homeFavAnimeContainer,
-            binding.homeFavAnimeRecyclerView,
-            binding.homeFavAnimeProgressBar,
-            binding.homeFavAnimeEmpty,
-            binding.homeFavAnime,
-            binding.homeFavAnimeMore,
-            getString(R.string.fav_anime)
-        )
-
-        initRecyclerView(
-            model.getAnimePlanned(),
-            binding.homePlannedAnimeContainer,
-            binding.homePlannedAnimeRecyclerView,
-            binding.homePlannedAnimeProgressBar,
-            binding.homePlannedAnimeEmpty,
-            binding.homePlannedAnime,
-            binding.homePlannedAnimeMore,
-            getString(R.string.planned_anime)
-        )
-        binding.homePlannedAnimeBrowseButton.setOnClickListener {
-            (requireActivity() as? MainActivity)?.navPillsViewModel?.setTab(1)
-        }
-
-        model.getAnimeContinue().observe(viewLifecycleOwner) { list ->
-            if (_binding != null && list != null && list.isNotEmpty() && PrefManager.getVal<Int>(PrefName.HomeBannerMode) == 2
-                && navBannerCurrentMediaId == -1) {
-                updateNavigatingBanner(list[0])
+        if (!loggedOutMode) {
+            initContinueWatchingRecyclerView(
+                model.getAnimeContinue(),
+                binding.homeContinueWatchingContainer,
+                binding.homeWatchingRecyclerView,
+                binding.homeWatchingProgressBar,
+                binding.homeWatchingEmpty,
+                binding.homeContinueWatch,
+                binding.homeContinueWatchMore,
+                getString(R.string.continue_watching)
+            )
+            binding.homeWatchingBrowseButton.setOnClickListener {
+                (requireActivity() as? MainActivity)?.navPillsViewModel?.setTab(1)
             }
-        }
 
-        initRecyclerView(
-            model.getRecommendation(),
-            binding.homeRecommendedContainer,
-            binding.homeRecommendedRecyclerView,
-            binding.homeRecommendedProgressBar,
-            binding.homeRecommendedEmpty,
-            binding.homeRecommended,
-            binding.homeRecommendedMore,
-            getString(R.string.recommended)
-        )
+            initRecyclerView(
+                model.getAnimeFav(),
+                binding.homeFavAnimeContainer,
+                binding.homeFavAnimeRecyclerView,
+                binding.homeFavAnimeProgressBar,
+                binding.homeFavAnimeEmpty,
+                binding.homeFavAnime,
+                binding.homeFavAnimeMore,
+                getString(R.string.fav_anime)
+            )
 
-        initRecyclerView(
-            model.getMissingSequels(),
-            binding.homeMissingSequelsContainer,
-            binding.homeMissingSequelsRecyclerView,
-            binding.homeMissingSequelsProgressBar,
-            binding.homeMissingSequelsEmpty,
-            binding.homeMissingSequels,
-            binding.homeMissingSequelsMore,
-            getString(R.string.missing_sequels)
-        )
+            initRecyclerView(
+                model.getAnimePlanned(),
+                binding.homePlannedAnimeContainer,
+                binding.homePlannedAnimeRecyclerView,
+                binding.homePlannedAnimeProgressBar,
+                binding.homePlannedAnimeEmpty,
+                binding.homePlannedAnime,
+                binding.homePlannedAnimeMore,
+                getString(R.string.planned_anime)
+            )
+            binding.homePlannedAnimeBrowseButton.setOnClickListener {
+                (requireActivity() as? MainActivity)?.navPillsViewModel?.setTab(1)
+            }
 
-        binding.homeHiddenItemsContainer.visibility = View.GONE
-        model.getHidden().observe(viewLifecycleOwner) {
-            if (it != null) {
-                if (it.isNotEmpty()) {
-                    binding.homeHiddenItemsRecyclerView.adapter =
-                        ConcatAdapter(
-                            MediaAdaptor(0, it, requireActivity()),
-                            SectionMoreAdapter { _ ->
-                                MediaListViewActivity.passedMedia = it
-                                ContextCompat.startActivity(
-                                    requireActivity(),
-                                    Intent(requireActivity(), MediaListViewActivity::class.java)
-                                        .putExtra("title", getString(R.string.hidden)),
-                                    null
-                                )
-                            }
+            model.getAnimeContinue().observe(viewLifecycleOwner) { list ->
+                if (_binding != null && list != null && list.isNotEmpty() && PrefManager.getVal<Int>(PrefName.HomeBannerMode) == 2
+                    && navBannerCurrentMediaId == -1) {
+                    updateNavigatingBanner(list[0])
+                }
+            }
+
+            initRecyclerView(
+                model.getRecommendation(),
+                binding.homeRecommendedContainer,
+                binding.homeRecommendedRecyclerView,
+                binding.homeRecommendedProgressBar,
+                binding.homeRecommendedEmpty,
+                binding.homeRecommended,
+                binding.homeRecommendedMore,
+                getString(R.string.recommended)
+            )
+
+            initRecyclerView(
+                model.getMissingSequels(),
+                binding.homeMissingSequelsContainer,
+                binding.homeMissingSequelsRecyclerView,
+                binding.homeMissingSequelsProgressBar,
+                binding.homeMissingSequelsEmpty,
+                binding.homeMissingSequels,
+                binding.homeMissingSequelsMore,
+                getString(R.string.missing_sequels)
+            )
+
+            binding.homeHiddenItemsContainer.visibility = View.GONE
+            model.getHidden().observe(viewLifecycleOwner) {
+                if (it != null) {
+                    if (it.isNotEmpty()) {
+                        binding.homeHiddenItemsRecyclerView.adapter =
+                            ConcatAdapter(
+                                MediaAdaptor(0, it, requireActivity()),
+                                SectionMoreAdapter { _ ->
+                                    MediaListViewActivity.passedMedia = it
+                                    ContextCompat.startActivity(
+                                        requireActivity(),
+                                        Intent(requireActivity(), MediaListViewActivity::class.java)
+                                            .putExtra("title", getString(R.string.hidden)),
+                                        null
+                                    )
+                                }
+                            )
+                        binding.homeHiddenItemsRecyclerView.layoutManager = LinearLayoutManager(
+                            requireContext(),
+                            LinearLayoutManager.HORIZONTAL,
+                            false
                         )
-                    binding.homeHiddenItemsRecyclerView.layoutManager = LinearLayoutManager(
-                        requireContext(),
-                        LinearLayoutManager.HORIZONTAL,
-                        false
-                    )
-                    binding.homeContinueWatch.setOnLongClickListener {
-                        binding.homeHiddenItemsContainer.visibility = View.VISIBLE
-                        binding.homeHiddenItemsRecyclerView.layoutAnimation =
-                            LayoutAnimationController(setSlideIn(), 0.25f)
-                        true
-                    }
-                    binding.homeHiddenItemsMore.setSafeOnClickListener { _ ->
-                        MediaListViewActivity.passedMedia = it
-                        ContextCompat.startActivity(
-                            requireActivity(),
-                            Intent(requireActivity(), MediaListViewActivity::class.java)
-                                .putExtra("title", getString(R.string.hidden)),
-                            null
-                        )
-                    }
-                    binding.homeHiddenItemsTitle.setOnLongClickListener {
-                        binding.homeHiddenItemsContainer.visibility = View.GONE
-                        true
+                        binding.homeContinueWatch.setOnLongClickListener {
+                            binding.homeHiddenItemsContainer.visibility = View.VISIBLE
+                            binding.homeHiddenItemsRecyclerView.layoutAnimation =
+                                LayoutAnimationController(setSlideIn(), 0.25f)
+                            true
+                        }
+                        binding.homeHiddenItemsMore.setSafeOnClickListener { _ ->
+                            MediaListViewActivity.passedMedia = it
+                            ContextCompat.startActivity(
+                                requireActivity(),
+                                Intent(requireActivity(), MediaListViewActivity::class.java)
+                                    .putExtra("title", getString(R.string.hidden)),
+                                null
+                            )
+                        }
+                        binding.homeHiddenItemsTitle.setOnLongClickListener {
+                            binding.homeHiddenItemsContainer.visibility = View.GONE
+                            true
+                        }
+                    } else {
+                        binding.homeContinueWatch.setOnLongClickListener {
+                            snackString(getString(R.string.no_hidden_items))
+                            true
+                        }
                     }
                 } else {
                     binding.homeContinueWatch.setOnLongClickListener {
@@ -528,16 +557,15 @@ class HomeFragment : Fragment() {
                         true
                     }
                 }
-            } else {
-                binding.homeContinueWatch.setOnLongClickListener {
-                    snackString(getString(R.string.no_hidden_items))
-                    true
-                }
             }
         }
 
         model.empty.observe(viewLifecycleOwner)
         {
+            if (loggedOutMode) {
+                binding.homeSaninContainer.visibility = View.GONE
+                return@observe
+            }
             binding.homeSaninContainer.visibility = if (it == true) View.VISIBLE else View.GONE
             if (AnimUtils.enabled(ani.sanin.settings.saving.PrefName.AnimatedVectorDrawables)) (binding.homeSaninIcon.drawable as? Animatable)?.start()
             binding.homeSaninContainer.startAnimation(setSlideUp())
@@ -566,6 +594,13 @@ class HomeFragment : Fragment() {
         PrefManager.getLiveVal(PrefName.RescueMode, false).asLiveBool()
             .observe(viewLifecycleOwner) { inRescueMode ->
 
+                if (loggedOutMode) {
+                    hideHomeSections()
+                    setupLoggedOutFocusChain()
+                    applyHomeBannerFocusChain()
+                    return@observe
+                }
+
                 val alOnlySections = listOf(
                     binding.homeFavAnimeContainer,
                 )
@@ -573,13 +608,19 @@ class HomeFragment : Fragment() {
                 if (inRescueMode) {
                     alOnlySections.forEach { it.visibility = View.GONE }
 
-                    binding.homeContinueWatchingContainer.visibility = View.VISIBLE
-                    binding.homePlannedAnimeContainer.visibility = View.VISIBLE
+                    if (!homeLoading) {
+                        binding.homeContinueWatchingContainer.visibility = View.VISIBLE
+                        binding.homePlannedAnimeContainer.visibility = View.VISIBLE
+                    }
                 } else {
                     val homeLayoutShow: List<Boolean> = PrefManager.getVal(PrefName.HomeLayout)
                     val alOnlyIndices = listOf(1)
+                    val favHasData =
+                        (binding.homeFavAnimeRecyclerView.adapter?.itemCount ?: 0) > 0
                     alOnlySections.forEachIndexed { idx, view ->
-                        if (homeLayoutShow.getOrElse(alOnlyIndices[idx]) { true }) {
+                        if (!homeLoading && favHasData &&
+                            homeLayoutShow.getOrElse(alOnlyIndices[idx]) { true }
+                        ) {
                             view.visibility = View.VISIBLE
                         } else {
                             view.visibility = View.GONE
@@ -601,7 +642,21 @@ class HomeFragment : Fragment() {
             }
             if (!running && shouldRefresh) {
                 running = true
+                homeLoading = true
+                showHomeLoading(true)
+                if (!loggedOutMode) hideHomeSections()
                 scope.launch {
+                    if (loggedOutMode) {
+                        withContext(Dispatchers.Main) {
+                            load()
+                            setupLoggedOutHome()
+                        }
+                        model.loaded = true
+                        live.postValue(false)
+                        _binding?.homeRefresh?.isRefreshing = false
+                        running = false
+                        return@launch
+                    }
                     withContext(Dispatchers.IO) {
                         val rescueMode: Boolean = PrefManager.getVal(PrefName.RescueMode)
                         if (rescueMode) {
@@ -693,8 +748,12 @@ class HomeFragment : Fragment() {
                     }
 
                     withContext(Dispatchers.Main) {
+                        val b = _binding ?: return@withContext
                         model.empty.postValue(empty)
-                        binding.homeHiddenItemsContainer.visibility = View.GONE
+                        b.homeHiddenItemsContainer.visibility = View.GONE
+                        homeLoading = false
+                        reapplyHomeLayout()
+                        showHomeLoading(false)
                     }
 
                     live.postValue(false)
@@ -706,6 +765,168 @@ class HomeFragment : Fragment() {
     }
 
     private fun <T : View> id(id: Int): T = requireView().findViewById(id)
+
+    private fun isTrackerLoggedOut(): Boolean {
+        val rescueMode = PrefManager.getVal(PrefName.RescueMode, false)
+        return if (rescueMode) {
+            PrefManager.getNullableVal<MAL.ResponseToken>(PrefName.MALToken, null) == null
+        } else {
+            PrefManager.getVal<String>(PrefName.AnilistToken).isNullOrBlank()
+        }
+    }
+
+    private fun hideHomeSections() {
+        val b = _binding ?: return
+        listOf(
+            b.homeContinueWatchingContainer,
+            b.homeFavAnimeContainer,
+            b.homePlannedAnimeContainer,
+            b.homeMissingSequelsContainer,
+            b.homeRecommendedContainer,
+            b.homeHiddenItemsContainer,
+            b.homeSaninContainer,
+        ).forEach { it.visibility = View.GONE }
+    }
+
+    private fun showHomeLoading(show: Boolean) {
+        val b = _binding ?: return
+        b.homeUserStatusContainer.visibility = if (show) View.VISIBLE else View.GONE
+        b.homeUserStatusProgressBar.visibility = if (show) View.VISIBLE else View.GONE
+        b.homeUserStatusRecyclerView.visibility = View.GONE
+    }
+
+    private fun clearLoggedOutHome() {
+        loggedOutJob?.cancel()
+        loggedOutJob = null
+        val b = _binding ?: return
+        loggedOutRowRecyclers.clear()
+        loggedOutItemFocusListeners.clear()
+        loggedOutRowViews.forEach { b.homeContainer.removeView(it) }
+        loggedOutRowViews.clear()
+        loggedOutCtaView?.let { b.homeContainer.removeView(it) }
+        loggedOutCtaView = null
+    }
+
+    private fun setupLoggedOutHome() {
+        val b = _binding ?: return
+        clearLoggedOutHome()
+        hideHomeSections()
+        homeLoading = true
+        showHomeLoading(true)
+
+        val cta = layoutInflater.inflate(R.layout.view_logged_out_cta, b.homeContainer, false)
+        val insertAt = (b.homeContainer.indexOfChild(b.homeHiddenItemsContainer) + 1)
+            .coerceIn(0, b.homeContainer.childCount)
+        b.homeContainer.addView(cta, insertAt)
+        loggedOutCtaView = cta
+
+        cta.findViewById<View>(R.id.loggedOutLinkButton).setOnClickListener {
+            startActivity(Intent(requireContext(), SettingsAccountActivity::class.java))
+        }
+        FocusEffectUtil.applyFocusListener(cta.findViewById(R.id.loggedOutLinkButton))
+
+        loggedOutJob = viewLifecycleOwner.lifecycleScope.launch {
+            val items = withContext(Dispatchers.IO) {
+                Kitsu.publicAnime(sort = "-userCount")
+            }
+            if (_binding == null) return@launch
+            if (items.isNotEmpty()) {
+                val row = createLoggedOutRow(getString(R.string.recommended), items)
+                b.homeContainer.addView(row, insertAt + 1)
+                loggedOutRowViews.add(row)
+                setupLoggedOutFocusChain()
+                applyHomeBannerFocusChain()
+            }
+            homeLoading = false
+            showHomeLoading(false)
+        }
+
+        setupLoggedOutFocusChain()
+        applyHomeBannerFocusChain()
+    }
+
+    private fun createLoggedOutRow(title: String, items: List<Media>): View {
+        val ctx = requireContext()
+        val mediaItems = ArrayList(items)
+        val container = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        val header = TextView(ctx).apply {
+            text = title
+            setPadding(24, 14, 24, 8)
+            textSize = 16f
+            setTypeface(Typeface.DEFAULT_BOLD)
+            setTextColor(ctx.getThemeColor(com.google.android.material.R.attr.colorOnSurface))
+        }
+        val list = RecyclerView(ctx).apply {
+            id = View.generateViewId()
+            layoutManager = LinearLayoutManager(ctx, LinearLayoutManager.HORIZONTAL, false)
+            val openMore: (View) -> Unit = { v ->
+                MediaListViewActivity.passedMedia = mediaItems
+                ContextCompat.startActivity(
+                    v.context,
+                    Intent(v.context, MediaListViewActivity::class.java).putExtra("title", title),
+                    null
+                )
+            }
+            adapter = ConcatAdapter(
+                MediaAdaptor(0, mediaItems, requireActivity()),
+                SectionMoreAdapter(openMore)
+            )
+            isNestedScrollingEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            setPadding(24, 0, 24, 0)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 11f.px }
+        }
+        container.addView(header)
+        container.addView(list)
+        loggedOutRowRecyclers.add(list)
+        if (loggedOutItemFocusListeners.add(list)) {
+            list.addOnChildAttachStateChangeListener(object : RecyclerView.OnChildAttachStateChangeListener {
+                override fun onChildViewAttachedToWindow(view: View) {
+                    wireLoggedOutItem(view)
+                }
+
+                override fun onChildViewDetachedFromWindow(view: View) {}
+            })
+        }
+        return container
+    }
+
+    private fun setupLoggedOutFocusChain() {
+        val ctaButton = loggedOutCtaView?.findViewById<View>(R.id.loggedOutLinkButton) ?: return
+        val rows = loggedOutRowRecyclers
+        if (rows.isEmpty()) {
+            ctaButton.nextFocusDownId = View.NO_ID
+            return
+        }
+        val first = rows.first()
+        ctaButton.nextFocusDownId = first.id
+        rows.forEachIndexed { index, rv ->
+            rv.isFocusable = true
+            rv.nextFocusUpId = if (index == 0) ctaButton.id else rows[index - 1].id
+            rv.nextFocusDownId = rows.getOrNull(index + 1)?.id ?: View.NO_ID
+            for (i in 0 until rv.childCount) {
+                wireLoggedOutItem(rv.getChildAt(i))
+            }
+        }
+    }
+
+    private fun wireLoggedOutItem(view: View) {
+        val rv = view.parent as? RecyclerView ?: return
+        val index = loggedOutRowRecyclers.indexOf(rv)
+        if (index < 0) return
+        val ctaButton = loggedOutCtaView?.findViewById<View>(R.id.loggedOutLinkButton)
+        view.nextFocusUpId = if (index == 0) {
+            ctaButton?.id ?: View.NO_ID
+        } else {
+            loggedOutRowRecyclers[index - 1].id
+        }
+        view.nextFocusDownId = loggedOutRowRecyclers.getOrNull(index + 1)?.id ?: View.NO_ID
+    }
 
     private class HomeSection(val container: ViewGroup, val rv: RecyclerView, val title: TextView)
 
@@ -799,7 +1020,7 @@ class HomeFragment : Fragment() {
         rv.layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
         rv.isFocusable = true
         rv.descendantFocusability = android.view.ViewGroup.FOCUS_AFTER_DESCENDANTS
-        rv.nextFocusDownId = R.id.homeWatchingRecyclerView
+        rv.nextFocusDownId = homeBannerDownTarget()
 
         rv.itemAnimator = null
         bannerSnapHelper.attachToRecyclerView(rv)
@@ -831,7 +1052,7 @@ class HomeFragment : Fragment() {
                                 intent.putExtra("anime", true)
                                 startActivity(intent)
                             }, urls, logos,
-                            nextFocusDownId = R.id.homeWatchingRecyclerView,
+                            nextFocusDownId = homeBannerDownTarget(),
                             layoutRes = layoutForBannerType(modern),
 
                             cardMode = !modern && !isClassicBanner(),
@@ -1202,6 +1423,9 @@ class HomeFragment : Fragment() {
         }
     }
 
+    private fun homeBannerDownTarget(): Int =
+        if (loggedOutCtaView != null) R.id.loggedOutLinkButton else R.id.homeWatchingRecyclerView
+
     private fun setupHomeBannerWatchBtn() {
         val btn = binding.homeBannerWatchBtn
         btn.setOnClickListener { currentHomeBannerMedia()?.let { openHomeBannerMedia(it) } }
@@ -1221,7 +1445,7 @@ class HomeFragment : Fragment() {
         }
         FocusEffectUtil.applyFocusListener(btn)
         btn.nextFocusUpId = R.id.mainCalendarContainer
-        btn.nextFocusDownId = R.id.homeWatchingRecyclerView
+        btn.nextFocusDownId = homeBannerDownTarget()
     }
 
     private fun currentHomeBannerMedia(): Media? {
@@ -1290,6 +1514,28 @@ class HomeFragment : Fragment() {
 
         for (i in 0 until b.homeWatchingRecyclerView.childCount) {
             b.homeWatchingRecyclerView.getChildAt(i).nextFocusUpId = cwItemUpTarget
+        }
+
+        val ctaButton = loggedOutCtaView?.findViewById<View>(R.id.loggedOutLinkButton)
+        if (ctaButton != null) {
+            val bannerVisible = b.homeBannerCardWrap.visibility == View.VISIBLE ||
+                b.homeNavigatingBannerContainer.visibility == View.VISIBLE
+            val bannerTarget = when {
+                !bannerVisible -> R.id.mainCalendarContainer
+                navActive -> R.id.homeBannerWatchBtn
+                isModernBanner() || isClassicBanner() -> R.id.homeBannerCarousel
+                else -> R.id.homeBannerWatchBtn
+            }
+            ctaButton.nextFocusUpId = bannerTarget
+            watchBtn.nextFocusDownId = ctaButton.id
+            b.homeBannerCarousel.nextFocusDownId = ctaButton.id
+            bannerCarouselAdapter?.nextFocusDownId = ctaButton.id
+            for (i in 0 until b.homeBannerCarousel.childCount) {
+                val child = b.homeBannerCarousel.getChildAt(i)
+                child.nextFocusDownId = ctaButton.id
+                child.findViewById<View>(R.id.bannerPlayBtn)?.nextFocusDownId = ctaButton.id
+            }
+            setupLoggedOutFocusChain()
         }
     }
 
@@ -1663,21 +1909,32 @@ class HomeFragment : Fragment() {
     }
 
     private fun reapplyHomeLayout() {
-        if (_binding == null || catalogueMode || PrefManager.getVal(PrefName.RescueMode)) return
+        val b = _binding ?: return
+        if (catalogueMode || homeLoading) return
+        val rescueMode = PrefManager.getVal<Boolean>(PrefName.RescueMode)
         val homeLayoutShow = PrefManager.getVal<List<Boolean>>(PrefName.HomeLayout)
-        val order = PrefManager.getVal<List<Int>>(PrefName.HomeLayoutOrder)
-        if (order.isEmpty()) return
-        val containers = homeSections().map { it.container }
-        containers.forEachIndexed { i, c ->
-            c.visibility = if (homeLayoutShow.getOrElse(i) { true }) View.VISIBLE else View.GONE
+        val sections = homeSections()
+        sections.forEachIndexed { i, section ->
+            val hasData = (section.rv.adapter?.itemCount ?: 0) > 0
+            val enabled =
+                if (rescueMode) i != 1 else homeLayoutShow.getOrElse(i) { true }
+            section.container.visibility =
+                if (hasData && enabled) View.VISIBLE else View.GONE
         }
-        var insertIndex = binding.homeContainer.indexOfChild(binding.homeHiddenItemsContainer) + 1
-        order.forEach { i ->
-            val container = containers.getOrNull(i)
-            if (container != null) {
-                binding.homeContainer.removeView(container)
-                binding.homeContainer.addView(container, insertIndex)
-                insertIndex++
+        if (!rescueMode) {
+            val order = PrefManager.getVal<List<Int>>(PrefName.HomeLayoutOrder)
+            if (order.isNotEmpty()) {
+                val containers = sections.map { it.container }
+                var insertIndex =
+                    b.homeContainer.indexOfChild(b.homeHiddenItemsContainer) + 1
+                order.forEach { i ->
+                    val container = containers.getOrNull(i)
+                    if (container != null) {
+                        b.homeContainer.removeView(container)
+                        b.homeContainer.addView(container, insertIndex)
+                        insertIndex++
+                    }
+                }
             }
         }
         setupSectionFocusChain()
@@ -1690,8 +1947,15 @@ class HomeFragment : Fragment() {
 
     override fun onDestroyView() {
         catalogueJob?.cancel()
+        loggedOutJob?.cancel()
+        loggedOutJob = null
+        loggedOutCtaView = null
+        loggedOutRowViews.clear()
+        loggedOutRowRecyclers.clear()
+        loggedOutItemFocusListeners.clear()
         bannerAutoScrollHandler?.removeCallbacksAndMessages(null)
         bannerSnapHelper.attachToRecyclerView(null)
+        homeLoading = false
         _binding = null
         super.onDestroyView()
     }
