@@ -78,10 +78,10 @@ class SettingsAnimeActivity : AppCompatActivity() {
             SubscreenBuilder.Section("Behavior", R.drawable.ic_set_misc, entries = listOf(
                 SubscreenBuilder.Entry(
                     title = "Startup Tab",
-                    desc = "Which tab opens on launch",
+                    desc = "Which tab opens on launch (per anime / TMDB mode)",
                     choice = SubscreenBuilder.Choice(
                         title = "Startup Tab",
-                        options = arrayOf("Home", "Search", "Library", "Extensions"),
+                        options = arrayOf("Home", "Explore", "Discover", "Library"),
                         currentIndex = PrefManager.getVal<Int>(PrefName.DefaultStartUpTab).coerceIn(0, 3),
                     ) { idx -> PrefManager.setVal(PrefName.DefaultStartUpTab, idx) },
                 ),
@@ -92,7 +92,7 @@ class SettingsAnimeActivity : AppCompatActivity() {
                 ),
                 SubscreenBuilder.Entry(
                     title = "Continue Media",
-                    desc = "Auto-resume from last position",
+                    desc = "Auto-continue episodes; disable for manual selection",
                     switch = PrefManager.getVal<Boolean>(PrefName.ContinueMedia) to { v: Boolean -> PrefManager.setVal(PrefName.ContinueMedia, v) },
                 ),
                 SubscreenBuilder.Entry(
@@ -107,20 +107,15 @@ class SettingsAnimeActivity : AppCompatActivity() {
                 ),
                 SubscreenBuilder.Entry(
                     title = "Search All Sources",
-                    desc = "Search across all installed sources",
+                    desc = "Try all sources when one returns nothing",
                     switch = PrefManager.getVal<Boolean>(PrefName.SearchSources) to { v: Boolean -> PrefManager.setVal(PrefName.SearchSources, v) },
                 ),
                 SubscreenBuilder.Entry(
-                    title = "Recently Updated Only",
-                    desc = "Only show recently updated entries",
-                    switch = PrefManager.getVal<Boolean>(PrefName.RecentlyListOnly) to { v: Boolean -> PrefManager.setVal(PrefName.RecentlyListOnly, v) },
-                ),
-                SubscreenBuilder.Entry(
                     title = "Keyboard Mode",
-                    desc = "System keyboard or in-app toggle",
+                    desc = "System keyboard or Custom Sanin Keyboard",
                     choice = SubscreenBuilder.Choice(
                         title = "Keyboard Mode",
-                        options = arrayOf("System Keyboard", "In-App Toggle"),
+                        options = arrayOf("System Keyboard", "Custom Sanin Keyboard"),
                         currentIndex = if (PrefManager.getVal<Int>(PrefName.KeyboardMode) == 2) 1 else 0,
                     ) { idx -> PrefManager.setVal(PrefName.KeyboardMode, if (idx == 1) 2 else 0) },
                 ),
@@ -129,15 +124,15 @@ class SettingsAnimeActivity : AppCompatActivity() {
                     desc = "Seconds before server load timeout",
                     choice = SubscreenBuilder.Choice(
                         title = "Server Timeout",
-                        options = arrayOf("4s", "8s", "12s (Default)", "16s", "20s", "30s"),
+                        options = arrayOf("4s", "8s", "12s", "16s", "20s", "30s (Default)"),
                         currentIndex = when (PrefManager.getVal<Int>(PrefName.ServerLoadTimeoutSeconds)) {
-                            4 -> 0; 8 -> 1; 12 -> 2; 16 -> 3; 20 -> 4; 30 -> 5; else -> 2
+                            4 -> 0; 8 -> 1; 12 -> 2; 16 -> 3; 20 -> 4; 30 -> 5; else -> 5
                         },
                     ) { idx -> PrefManager.setVal(PrefName.ServerLoadTimeoutSeconds, intArrayOf(4, 8, 12, 16, 20, 30)[idx]) },
                 ),
                 SubscreenBuilder.Entry(
                     title = "Smart Source Memory",
-                    desc = "Remember last source across sessions",
+                    desc = "Remember last used source for new titles",
                     switch = PrefManager.getVal<Boolean>(PrefName.SmartSourcePersistence) to {
                         PrefManager.setVal(PrefName.SmartSourcePersistence, it)
                     },
@@ -151,6 +146,46 @@ class SettingsAnimeActivity : AppCompatActivity() {
                 ),
             )),
 
+            SubscreenBuilder.Section("Auto play", R.drawable.ic_set_video, entries = listOf(
+                SubscreenBuilder.Entry(
+                    title = "Source selection",
+                    desc = "Manual or automatic stream start",
+                    choice = SubscreenBuilder.Choice(
+                        title = "Source selection",
+                        options = arrayOf("Manual", "Automatic"),
+                        currentIndex = if (PrefManager.getVal<Int>(PrefName.AutoPlayMode) == 1) 1 else 0,
+                    ) { idx -> PrefManager.setVal(PrefName.AutoPlayMode, if (idx == 1) 1 else 0) },
+                ),
+                SubscreenBuilder.Entry(
+                    title = "Auto play timeout",
+                    desc = "How long to search for a stream before showing the source screen",
+                    slider = SubscreenBuilder.SliderOption(
+                        value = PrefManager.getVal<Int>(PrefName.AutoPlayStreamTimeout)
+                            .coerceIn(15, 90).toFloat(),
+                        valueFrom = 15f,
+                        valueTo = 90f,
+                        step = 5f,
+                        suffix = "s",
+                    ) { v -> PrefManager.setVal(PrefName.AutoPlayStreamTimeout, v.toInt()) },
+                ),
+                SubscreenBuilder.Entry(
+                    title = "Preferred quality",
+                    desc = "Preferred stream quality when auto-playing",
+                    choice = SubscreenBuilder.Choice(
+                        title = "Preferred quality",
+                        options = arrayOf("None", "360p", "720p", "1080p"),
+                        currentIndex = when (PrefManager.getVal<String>(PrefName.AutoPlayPreferredQuality)) {
+                            "360p" -> 1; "720p" -> 2; "1080p" -> 3; else -> 0
+                        },
+                    ) { idx ->
+                        PrefManager.setVal(
+                            PrefName.AutoPlayPreferredQuality,
+                            arrayOf("None", "360p", "720p", "1080p")[idx],
+                        )
+                    },
+                ),
+            )),
+
             SubscreenBuilder.Section("Library Sync", R.drawable.ic_set_anime, entries = listOf(
                 SubscreenBuilder.Entry(
                     title = "Auto-Sync AniList",
@@ -158,13 +193,8 @@ class SettingsAnimeActivity : AppCompatActivity() {
                     switch = PrefManager.getVal<Boolean>(PrefName.AutoSyncAniList) to { v: Boolean -> PrefManager.setVal(PrefName.AutoSyncAniList, v) },
                 ),
                 SubscreenBuilder.Entry(
-                    title = "Auto-Update Progress",
-                    desc = "Turning on hides the prompt to track a new show and tracks automatically.",
-                    switch = PrefManager.getVal<Boolean>(PrefName.AutoTrackNewShows) to { v: Boolean -> PrefManager.setVal(PrefName.AutoTrackNewShows, v) },
-                ),
-                SubscreenBuilder.Entry(
-                    title = "Include in Library",
-                    desc = "Show anime list in library tab",
+                    title = "Include Listed Anime in Discover",
+                    desc = "Show anime already on your AniList list in the Home/Discover rows (trending, top rated, most favourite).",
                     switch = PrefManager.getVal<Boolean>(PrefName.IncludeAnimeList) to {
                         PrefManager.setVal(PrefName.IncludeAnimeList, it); restartApp()
                     },

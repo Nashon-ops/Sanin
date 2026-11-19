@@ -211,6 +211,7 @@
     <string name="chap">Chapter</string>
     <string name="wrong"><u>Wrong Title?</u></string>
     <string name="anime_watch_refreshed">Refreshed successfully</string>
+    <string name="tmdb_servers_refreshed_all">Refreshed all successfully</string>
     <string name="anime_watch_no_webpage">No webpage for this source</string>
     <string name="anime_watch_style_bars">Episode layout: Bars</string>
     <string name="anime_watch_style_compact">Episode layout: Compact</string>
@@ -227,8 +228,11 @@
     </string>
     <string name="not_supported">%1$s is not supported!</string>
     <string name="server_selector">Select Server</string>
+    <string name="servers">Servers</string>
+    <string name="sources">Sources</string>
     <string name="auto_select_server">Auto Selecting Server</string>
     <string name="make_default">Make Default</string>
+    <string name="download_mode">Download mode</string>
     <string name="select_quality">Select Quality</string>
     <string name="remember_quality_choice">Remember my choice</string>
     <string name="quality_auto">Auto</string>
@@ -297,7 +301,6 @@
     <string name="extensions">Extensions</string>
     <string name="extension_updates_available">Extension updates available</string>
     <string name="player_settings">Player Settings</string>
-    <string name="recentlyListOnly">Only show my content in \"Recently Updated\"</string>
     <string name="download_manager_select">Download Manager</string>
     <string name="downloadInSd">Download in SD card</string>
     <string name="noSdFound">No SD card was Found.</string>
@@ -506,6 +509,9 @@
     <string name="filter">Filter</string>
     <string name="year">Year</string>
     <string name="apply">Apply</string>
+    <string name="exit">Exit</string>
+    <string name="exit_player_title">Exit playback?</string>
+    <string name="exit_player_message">Your progress is saved. You can resume anytime.</string>
     <string name="cancel">Cancel</string>
     <string name="edit">Edit</string>
     <string name="publish">Publish</string>
@@ -732,6 +738,7 @@
     <string name="auto_select_server_error">Couldn\'t auto select the server, Please try again!</string>
     <string name="empty_episodes_list">Episode list is empty, Please try again!</string>
     <string name="stream_selection_empty">No streams available! Try another source.</string>
+    <string name="playback_session_expired">Playback session expired, please open the title again.</string>
     <string name="logging_in_mal">Logging into MAL</string>
     <string name="getting_user_data">Getting User Data</string>
     <string name="no_next_episode">No next episode found!</string>
@@ -1245,7 +1252,6 @@ Non quae tempore quo provident laudantium qui illo dolor vel quia dolor et exerc
     <string name="change_download_location_desc">Change the location where all the downloaded stuff goes</string>
     <string name="always_continue_content_desc">Continue where you left off</string>
     <string name="search_source_list_desc">Auto-select the next server if the previous server doesn\'t have the media</string>
-    <string name="recentlyListOnly_desc">Show only your list items in the recent tab</string>
     <string name="adult_only_content_desc">Show only adult content in the explore page</string>
     <string name="anime_add_repository_desc">Add Anime Extensions from various sources</string>
     <string name="manga_add_repository_desc">Add Manga Extensions from various sources</string>
@@ -2618,7 +2624,11 @@ Non quae tempore quo provident laudantium qui illo dolor vel quia dolor et exerc
 
 <string name="preview_seekbar">Seekbar preview</string>
 
-<string name="preview_seekbar_desc">Enable preview thumbnail on seekbar</string>
+<string name="preview_seekbar_desc">Show a thumbnail while scrubbing or seeking with the D-pad</string>
+
+<string name="preview_seekbar_preload">Load previews in background on player start</string>
+
+<string name="preview_seekbar_preload_desc">Preloads thumbnails in memory after playback starts. Direct videos only; may briefly stutter on slower devices.</string>
 
 <string name="no_subtitles_loaded">No subtitles loaded yet</string>
 

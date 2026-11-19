@@ -137,15 +137,30 @@ class PlayerSettingsActivity :
                     },
                 ),
                 SubscreenBuilder.Entry(
-                    title = getString(R.string.video_buffer_size_settings),
-                    desc = "Video buffer in megabytes",
+                    title = "Buffer duration",
+                    desc = "Maximum forward buffer time.",
                     choice = SubscreenBuilder.Choice(
-                        title = getString(R.string.video_buffer_size_settings),
-                        options = arrayOf("16 MB", "32 MB", "64 MB", "128 MB"),
-                        currentIndex = when (PrefManager.getVal<Int>(PrefName.BufferSize)) {
-                            16 -> 0; 32 -> 1; 64 -> 2; 128 -> 3; else -> 1
+                        title = "Buffer duration",
+                        options = arrayOf("15 s", "30 s", "60 s", "90 s", "120 s"),
+                        currentIndex = when (PrefManager.getVal<Int>(PrefName.BufferDurationSeconds)) {
+                            15 -> 0; 30 -> 1; 60 -> 2; 90 -> 3; 120 -> 4; else -> 2
                         },
-                    ) { idx -> PrefManager.setVal(PrefName.BufferSize, intArrayOf(16, 32, 64, 128)[idx]) },
+                    ) { idx ->
+                        PrefManager.setVal(PrefName.BufferDurationSeconds, intArrayOf(15, 30, 60, 90, 120)[idx])
+                    },
+                ),
+                SubscreenBuilder.Entry(
+                    title = "Buffer memory limit",
+                    desc = "Caps RAM used by playback buffers.",
+                    choice = SubscreenBuilder.Choice(
+                        title = "Buffer memory limit",
+                        options = arrayOf("64 MB", "128 MB", "192 MB", "256 MB"),
+                        currentIndex = when (PrefManager.getVal<Int>(PrefName.BufferTargetMb)) {
+                            64 -> 0; 128 -> 1; 192 -> 2; 256 -> 3; else -> 1
+                        },
+                    ) { idx ->
+                        PrefManager.setVal(PrefName.BufferTargetMb, intArrayOf(64, 128, 192, 256)[idx])
+                    },
                 ),
                 SubscreenBuilder.Entry(
                     title = "Pause Overlay",
@@ -157,7 +172,7 @@ class PlayerSettingsActivity :
                 ),
                 SubscreenBuilder.Entry(
                     title = "Wrap Buttons",
-                    desc = "Player control button style",
+                    desc = "Background tint behind player control buttons",
                     choice = SubscreenBuilder.Choice(
                         title = "Wrap Buttons",
                         options = wrapBtnLabels,
@@ -254,6 +269,26 @@ class PlayerSettingsActivity :
                         PrefManager.setVal(PrefName.Pip, it)
                     },
                     isEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N,
+                ),
+                SubscreenBuilder.Entry(
+                    title = "Decoder",
+                    desc = "Hardware is fastest; Hardware+ falls back to software; Software is most compatible.",
+                    iconRes = R.drawable.ic_baseline_memory_24,
+                    choice = SubscreenBuilder.Choice(
+                        title = "Decoder",
+                        options = arrayOf("Hardware", "Hardware+", "Software"),
+                        currentIndex = PrefManager.getVal<Int>(PrefName.DecodingMode).coerceIn(0, 2),
+                    ) { idx -> PrefManager.setVal(PrefName.DecodingMode, idx) },
+                ),
+                SubscreenBuilder.Entry(
+                    title = "Video output",
+                    desc = "SurfaceView is fastest; TextureView fixes black video on some devices.",
+                    iconRes = R.drawable.ic_set_video,
+                    choice = SubscreenBuilder.Choice(
+                        title = "Video output",
+                        options = arrayOf("SurfaceView", "TextureView"),
+                        currentIndex = PrefManager.getVal<Int>(PrefName.VideoOutput).coerceIn(0, 1),
+                    ) { idx -> PrefManager.setVal(PrefName.VideoOutput, idx) },
                 ),
             )),
         ))
@@ -536,6 +571,23 @@ class PlayerSettingsActivity :
                         PrefManager.setVal(PrefName.AutoHideTimeStamps, it)
                     },
                 ),
+                SubscreenBuilder.Entry(
+                    title = getString(R.string.preview_seekbar),
+                    desc = getString(R.string.preview_seekbar_desc),
+                    switch = PrefManager.getVal<Boolean>(PrefName.SeekPreview) to { checked ->
+                        PrefManager.setVal(PrefName.SeekPreview, checked)
+                        if (!checked) PrefManager.setVal(PrefName.SeekPreviewPreload, false)
+                        binding.tabLayout.getTabAt(2)?.select()
+                    },
+                ),
+                SubscreenBuilder.Entry(
+                    title = getString(R.string.preview_seekbar_preload),
+                    desc = getString(R.string.preview_seekbar_preload_desc),
+                    isEnabled = PrefManager.getVal<Boolean>(PrefName.SeekPreview),
+                    switch = PrefManager.getVal<Boolean>(PrefName.SeekPreviewPreload) to {
+                        PrefManager.setVal(PrefName.SeekPreviewPreload, it)
+                    },
+                ),
             )),
 
             SubscreenBuilder.Section("Automations", R.drawable.ic_set_misc, entries = listOf(
@@ -585,11 +637,13 @@ class PlayerSettingsActivity :
         SubscreenBuilder.build(this, binding.tabContent, listOf(
             SubscreenBuilder.Section(getString(R.string.update_progress), R.drawable.ic_set_anime, entries = listOf(
                 SubscreenBuilder.Entry(
-                    title = getString(R.string.ask_update_progress_anime),
-                    desc = getString(R.string.ask_update_progress_info_ep),
-                    switch = PrefManager.getVal<Boolean>(PrefName.AskIndividualPlayer) to {
-                        PrefManager.setVal(PrefName.AskIndividualPlayer, it)
-                    },
+                    title = "Update progress",
+                    desc = "Always saves; Ask prompts once per title; Never skips tracking",
+                    choice = SubscreenBuilder.Choice(
+                        title = "Update progress",
+                        options = arrayOf("Always", "Ask per title", "Never"),
+                        currentIndex = PrefManager.getVal<Int>(PrefName.ProgressUpdateMode).coerceIn(0, 2),
+                    ) { idx -> PrefManager.setVal(PrefName.ProgressUpdateMode, idx) },
                 ),
                 SubscreenBuilder.Entry(
                     title = getString(R.string.ask_update_progress_chapter_zero),

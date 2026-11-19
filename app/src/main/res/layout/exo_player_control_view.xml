@@ -127,6 +127,8 @@
                             android:layout_width="48dp"
                             android:layout_height="48dp"
                             android:focusable="true"
+                            android:nextFocusRight="@id/exo_source"
+                            android:nextFocusUp="@id/exo_progress"
                             android:backgroundTint="#00FFFFFF"
                             android:scaleX="-1"
                             android:src="@drawable/ic_round_subtitles_24"
@@ -139,9 +141,25 @@
                             android:layout_width="48dp"
                             android:layout_height="48dp"
                             android:focusable="true"
+                            android:nextFocusLeft="@id/exo_sub"
+                            android:nextFocusRight="@id/exo_tracks"
+                            android:nextFocusUp="@id/exo_progress"
                             android:backgroundTint="#00FFFFFF"
                             android:src="@drawable/ic_round_source_24"
                             tools:ignore="ContentDescription,SpeakableTextPresentCheck" />
+
+                        <ImageButton
+                            android:id="@+id/exo_tracks"
+                            android:layout_width="48dp"
+                            android:layout_height="48dp"
+                            android:focusable="true"
+                            android:visibility="gone"
+                            android:nextFocusLeft="@id/exo_source"
+                            android:nextFocusRight="@id/exo_rotate"
+                            android:nextFocusUp="@id/exo_progress"
+                            android:backgroundTint="#00FFFFFF"
+                            android:src="@drawable/ic_tracks_24"
+                            tools:ignore="ContentDescription" />
 
                     </LinearLayout>
 
@@ -168,6 +186,9 @@
                         android:layout_width="48dp"
                         android:layout_height="48dp"
                         android:focusable="true"
+                        android:nextFocusLeft="@id/exo_tracks"
+                        android:nextFocusRight="@id/exo_screen"
+                        android:nextFocusUp="@id/exo_skip"
                         android:backgroundTint="#00FFFFFF"
                         android:src="@drawable/ic_rotate_mobile_24"
                         android:contentDescription="Rotate"
@@ -178,6 +199,9 @@
                         android:layout_width="48dp"
                         android:layout_height="48dp"
                         android:focusable="true"
+                        android:nextFocusLeft="@id/exo_rotate"
+                        android:nextFocusRight="@id/exo_playback_speed"
+                        android:nextFocusUp="@id/exo_skip"
                         android:backgroundTint="#00FFFFFF"
                         android:src="@drawable/ic_aspect_ratio_filled_24"
                         android:padding="2dp"
@@ -185,18 +209,19 @@
                         tools:ignore="ContentDescription,SpeakableTextPresentCheck" />
 
                     <ImageButton
-                        android:id="@+id/exo_ep_sel_btn"
+                        android:id="@id/exo_playback_speed"
                         android:layout_width="48dp"
                         android:layout_height="48dp"
                         android:layout_marginStart="6dp"
                         android:layout_marginEnd="2dp"
                         android:focusable="true"
                         android:backgroundTint="#00FFFFFF"
-                        android:src="@drawable/ic_episodes_24"
-                        android:contentDescription="@string/episodes"
+                        android:src="@drawable/ic_round_slow_motion_video_24"
+                        app:tint="#fff"
                         android:nextFocusLeft="@id/exo_screen"
+                        android:nextFocusRight="@id/exo_source"
                         android:nextFocusUp="@id/exo_skip"
-                        tools:ignore="SpeakableTextPresentCheck" />
+                        tools:ignore="ContentDescription,SpeakableTextPresentCheck" />
                 </LinearLayout>
 
                 </LinearLayout>
@@ -466,7 +491,7 @@
                             android:layout_height="48dp"
                             android:focusable="true"
                             android:nextFocusLeft="@id/exo_autoplay"
-                            android:nextFocusRight="@id/exo_playback_speed"
+                            android:nextFocusRight="@id/exo_settings"
                             android:nextFocusDown="@id/exo_play"
                             android:backgroundTint="#00FFFFFF"
                             android:src="@drawable/ic_skip_24"
@@ -475,25 +500,12 @@
                             tools:ignore="ContentDescription,SpeakableTextPresentCheck" />
 
                         <ImageButton
-                            android:id="@id/exo_playback_speed"
-                            android:layout_width="48dp"
-                            android:layout_height="48dp"
-                            android:focusable="true"
-                            android:nextFocusLeft="@id/exo_skip_op_ed"
-                            android:nextFocusRight="@id/exo_settings"
-                            android:nextFocusDown="@id/exo_play"
-                            android:backgroundTint="#00FFFFFF"
-                            android:src="@drawable/ic_round_slow_motion_video_24"
-                            app:tint="#fff"
-                            tools:ignore="ContentDescription,SpeakableTextPresentCheck" />
-
-                        <ImageButton
                             android:id="@+id/exo_settings"
                             android:layout_width="48dp"
                             android:layout_height="48dp"
                             android:focusable="true"
-                            android:nextFocusLeft="@id/exo_playback_speed"
-                            android:nextFocusRight="@id/exo_tracks"
+                            android:nextFocusLeft="@id/exo_skip_op_ed"
+                            android:nextFocusRight="@id/exo_ep_sel_btn"
                             android:nextFocusDown="@id/exo_play"
                             android:backgroundTint="#00FFFFFF"
                             android:src="@drawable/ic_round_video_settings_24"
@@ -501,18 +513,18 @@
                             tools:ignore="ContentDescription,SpeakableTextPresentCheck" />
 
                         <ImageButton
-                            android:id="@+id/exo_tracks"
+                            android:id="@+id/exo_ep_sel_btn"
                             android:layout_width="48dp"
                             android:layout_height="48dp"
                             android:focusable="true"
-                            android:visibility="gone"
                             android:nextFocusLeft="@id/exo_settings"
                             android:nextFocusRight="@id/exo_back"
                             android:nextFocusDown="@id/exo_play"
+                            android:nextFocusUp="@id/exo_skip"
                             android:backgroundTint="#00FFFFFF"
-                            android:src="@drawable/ic_tracks_24"
-                            app:tint="@color/bg_white"
-                            tools:ignore="ContentDescription" />
+                            android:src="@drawable/ic_episodes_24"
+                            android:contentDescription="@string/episodes"
+                            tools:ignore="SpeakableTextPresentCheck" />
                     </LinearLayout>
                     </LinearLayout>
 
@@ -658,5 +670,47 @@
         </LinearLayout>
 
     </FrameLayout>
+
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/exo_seek_preview_card"
+        android:layout_width="160dp"
+        android:layout_height="90dp"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="96dp"
+        android:visibility="gone"
+        app:cardBackgroundColor="#E6000000"
+        app:cardCornerRadius="8dp"
+        app:cardElevation="8dp"
+        tools:visibility="visible">
+
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent">
+
+            <ImageView
+                android:id="@+id/exo_seek_preview_image"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:contentDescription="@string/preview_seekbar"
+                android:scaleType="centerCrop" />
+
+            <TextView
+                android:id="@+id/exo_seek_preview_time"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|end"
+                android:background="#B3000000"
+                android:fontFamily="@font/poppins"
+                android:includeFontPadding="false"
+                android:paddingStart="6dp"
+                android:paddingTop="2dp"
+                android:paddingEnd="6dp"
+                android:paddingBottom="2dp"
+                android:textColor="#FFFFFF"
+                android:textSize="12sp"
+                tools:ignore="RtlSymmetry"
+                tools:text="12:34" />
+        </FrameLayout>
+    </com.google.android.material.card.MaterialCardView>
 
 </FrameLayout>
