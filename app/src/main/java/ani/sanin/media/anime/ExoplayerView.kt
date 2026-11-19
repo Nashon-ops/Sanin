@@ -1,4 +1,5 @@
 package ani.sanin.media.anime
+import ani.sanin.isTvDevice
 import ani.sanin.settings.AnimUtils
 import ani.sanin.ui.components.TomoeView
 
@@ -48,6 +49,7 @@ import android.view.animation.AnimationUtils
 import android.widget.AdapterView
 import android.widget.ImageButton
 import android.widget.ImageView
+import android.widget.HorizontalScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import com.google.android.material.chip.Chip
@@ -96,6 +98,7 @@ import androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist
 import androidx.media3.exoplayer.hls.playlist.HlsPlaylistTracker
 import androidx.media3.exoplayer.DefaultLivePlaybackSpeedControl
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.SingleSampleMediaSource
 import androidx.media3.exoplayer.drm.DefaultDrmSessionManager
@@ -103,6 +106,7 @@ import androidx.media3.exoplayer.drm.FrameworkMediaDrm
 import androidx.media3.exoplayer.drm.DrmSessionManager
 import androidx.media3.exoplayer.drm.LocalMediaDrmCallback
 import androidx.media3.exoplayer.drm.HttpMediaDrmCallback
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 
 import androidx.media3.session.MediaSession
@@ -119,6 +123,7 @@ import androidx.media3.ui.CaptionStyleCompat.EDGE_TYPE_NONE
 import androidx.media3.ui.CaptionStyleCompat.EDGE_TYPE_OUTLINE
 import androidx.media3.ui.DefaultTimeBar
 import androidx.media3.ui.PlayerControlView
+import androidx.media3.ui.TimeBar
 import androidx.media3.ui.PlayerView
 import androidx.media3.ui.SubtitleView
 import ani.sanin.GesturesListener
@@ -270,12 +275,17 @@ class ExoplayerView :
     private lateinit var subtitleLangButton: ImageButton
     private lateinit var subtitleDrawerList: RecyclerView
     private var subtitleRailController: SubtitleRailController? = null
+    private var serverRailController: ServerRailController? = null
+    private lateinit var serverDrawerContent: View
+    private lateinit var serverDrawerClose: ImageButton
+    private lateinit var serverRailRefreshAll: View
+    private lateinit var serverRailMakeDefault: android.widget.CheckBox
+    private lateinit var serverRailTabs: com.google.android.material.tabs.TabLayout
+    private lateinit var serverRailChipsScroll: HorizontalScrollView
+    private lateinit var serverRailChips: ChipGroup
+    private lateinit var serverRailList: RecyclerView
     private var embeddedSubTracks: List<Tracks.Group> = emptyList()
     private var playerTracksBtn: ImageButton? = null
-    private lateinit var tracksDrawerContent: View
-    private lateinit var tracksDrawerClose: ImageButton
-    private lateinit var tracksDrawerList: RecyclerView
-    private var trackRailController: TrackRailController? = null
     private var tracksHidden = true
     private lateinit var exoAudioTrack: ImageButton
     private lateinit var exoSpeed: ImageButton
@@ -318,6 +328,21 @@ class ExoplayerView :
     private var assSubtitleView: io.github.peerless2012.ass.media.widget.AssSubtitleView? = null
     private lateinit var assMediaSourceFactory: DefaultMediaSourceFactory
 
+    private lateinit var seekPreviewCard: View
+    private lateinit var seekPreviewImage: ImageView
+    private lateinit var seekPreviewTime: TextView
+    private var seekPreviewController: SeekPreviewController? = null
+    private var seekPreviewEnabled = false
+    private var seekPreviewPreload = false
+    private var seekPreviewIsTv = false
+    private var seekPreviewMode = false
+    private var seekPreviewPositionMs = 0L
+    private var seekPreviewResumePlayback = false
+    private var seekPreviewTicker: Runnable? = null
+    private var seekPreviewSavedTimeoutMs = 0
+    private var previewMediaItem: MediaItem? = null
+    private var previewSourceFactory: MediaSource.Factory? = null
+
     private var orientationListener: OrientationEventListener? = null
 
     private var hasExtSubtitles = false
@@ -338,11 +363,9 @@ class ExoplayerView :
 
         var offlinePlayback = false
 
-        private const val DEFAULT_MIN_BUFFER_MS = 30000
-        private const val DEFAULT_MAX_BUFFER_MS = 60000
-        private const val BUFFER_FOR_PLAYBACK_MS = 8000
-        private const val BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 5000
-        private const val BACK_BUFFER_DURATION_MS = 1000 * 60 * 2
+        private const val BUFFER_FOR_PLAYBACK_MS = 2000
+        private const val BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 4000
+        private const val BACK_BUFFER_DURATION_MS = 20_000
         private const val MAX_PLAYER_ERROR_RETRIES = 1
         private const val MAX_LIVE_RECONNECTS = 3
         private const val AUTO_SYNC_INTERVAL_MS = 15_000L
@@ -394,6 +417,10 @@ class ExoplayerView :
     private var isInitialized = false
     private var isPlayerPlaying = true
     private var changingServer = false
+    private var recreating = false
+    private var autoContinuePending = false
+    private var autoContinueServer: String? = null
+    private var playerReleased = false
     private var interacted = false
 
     private var pipEnabled = false
@@ -596,6 +623,16 @@ class ExoplayerView :
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        if (!initialized) {
+            android.widget.Toast.makeText(
+                this,
+                R.string.playback_session_expired,
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
+            startMainActivity(this)
+            return
+        }
+
         ThemeManager(this).applyTheme()
         OledBackgroundManager.remove(this)
         binding = ActivityExoplayerBinding.inflate(layoutInflater)
@@ -603,7 +640,21 @@ class ExoplayerView :
 
         hideSystemBarsExtendView()
 
+        val playerViewContainer = findViewById<ViewGroup>(R.id.player_view_container)
+        val playerLayout = if (PrefManager.getVal<Int>(PrefName.VideoOutput) == 1) {
+            R.layout.player_view_texture
+        } else {
+            R.layout.player_view_surface
+        }
+        layoutInflater.inflate(playerLayout, playerViewContainer, true)
         playerView = findViewById(R.id.player_view)
+
+        seekPreviewCard = playerView.findViewById(R.id.exo_seek_preview_card)
+        seekPreviewImage = playerView.findViewById(R.id.exo_seek_preview_image)
+        seekPreviewTime = playerView.findViewById(R.id.exo_seek_preview_time)
+        seekPreviewIsTv = isTvDevice(this)
+        seekPreviewController = SeekPreviewController(this)
+        setupSeekPreview()
 
         exoPlay = playerView.findViewById(androidx.media3.ui.R.id.exo_play)
         exoSource = playerView.findViewById(R.id.exo_source)
@@ -732,7 +783,7 @@ class ExoplayerView :
             }
             override fun onDrawerClosed(drawerView: View) {
                 if (drawerView !== episodeDrawerContent) return
-                if (episodeCommentPanel.visibility != View.VISIBLE) {
+                if (episodeCommentPanel.visibility != View.VISIBLE && !isAnyRailOpen()) {
                     playerView.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
                     playerView.isFocusable = true
                     episodeTitleBtn.requestFocus()
@@ -765,6 +816,39 @@ class ExoplayerView :
             subtitleDrawerList,
         )
 
+        serverDrawerContent = findViewById(R.id.serverDrawer)
+        serverDrawerClose = findViewById(R.id.serverDrawerClose)
+        serverRailRefreshAll = findViewById(R.id.serverRailRefreshAll)
+        serverRailMakeDefault = findViewById(R.id.serverRailMakeDefault)
+        serverRailChipsScroll = findViewById(R.id.serverRailChipsScroll)
+        serverRailChips = findViewById(R.id.serverRailChips)
+        serverRailList = findViewById(R.id.serverRailList)
+        serverRailTabs = findViewById(R.id.railTabs)
+        serverRailController = ServerRailController(
+            this,
+            model,
+            serverDrawerContent,
+            serverDrawerClose,
+            serverRailTabs,
+            findViewById(R.id.serverRailStrip),
+            serverRailRefreshAll,
+            serverRailMakeDefault,
+            serverRailChipsScroll,
+            serverRailChips,
+            serverRailList,
+            onOpened = {
+                playerView.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+                playerView.isFocusable = false
+            },
+            onClosed = {
+                if (!isAnyRailOpen()) {
+                    playerView.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+                    playerView.isFocusable = true
+                    exoSource.requestFocus()
+                }
+            },
+        )
+
         binding.root.addDrawerListener(object : DrawerLayout.DrawerListener {
             override fun onDrawerSlide(drawerView: View, slideOffset: Float) {}
             override fun onDrawerOpened(drawerView: View) {
@@ -775,34 +859,20 @@ class ExoplayerView :
             }
             override fun onDrawerClosed(drawerView: View) {
                 if (drawerView !== subtitleDrawerContent) return
-                playerView.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
-                playerView.isFocusable = true
-                exoSubtitle.requestFocus()
+                if (!isAnyRailOpen()) {
+                    playerView.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+                    playerView.isFocusable = true
+                    exoSubtitle.requestFocus()
+                }
             }
             override fun onDrawerStateChanged(newState: Int) {}
         })
 
-        tracksDrawerContent = findViewById(R.id.tracksDrawer)
-        tracksDrawerClose = findViewById(R.id.tracksDrawerClose)
-        tracksDrawerList = findViewById(R.id.tracksDrawerList)
-        trackRailController = TrackRailController(
-            this,
-            tracksDrawerContent,
-            tracksDrawerClose,
-            tracksDrawerList,
-        )
         playerTracksBtn = playerView.findViewById(R.id.exo_tracks)
 
-        trackRailController?.let { rail ->
-            playerTracksBtn?.setOnClickListener {
-                Logger.log("Player: TRACKS pressed")
-                rail.open()
-                playerView.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
-                playerView.isFocusable = false
-            }
-            tracksDrawerClose.setOnClickListener {
-                closeTracksRail()
-            }
+        playerTracksBtn?.setOnClickListener {
+            Logger.log("Player: TRACKS pressed — opening sources & tracks rail (tracks tab)")
+            serverRailController?.openTracksTab()
         }
 
         playerView.controllerShowTimeoutMs = PrefManager.getVal<Int>(PrefName.AutoHideTimeout) * 1000
@@ -865,6 +935,10 @@ class ExoplayerView :
                     View.VISIBLE
                 }
             (exoSkipOpEd.parent as? ViewGroup)?.requestLayout()
+            playerView.findViewById<View>(R.id.exo_autoplay)?.nextFocusRightId =
+                if (exoSkipOpEd.isVisible) R.id.exo_skip_op_ed else R.id.exo_settings
+            exoSettings.nextFocusLeftId =
+                if (exoSkipOpEd.isVisible) R.id.exo_skip_op_ed else R.id.exo_autoplay
         }
 
         exoSkipOpEd.alpha = if (PrefManager.getVal(PrefName.AutoSkipOPED)) 1f else 0.3f
@@ -1036,14 +1110,52 @@ class ExoplayerView :
 
         val tracksButton = playerView.findViewById<View>(R.id.exo_tracks)
         val autoplayButton = playerView.findViewById<View>(R.id.exo_autoplay)
+        val sourceButton = playerView.findViewById<View>(R.id.exo_source)
+        val subButton = playerView.findViewById<View>(R.id.exo_sub)
+        val rotateButton = playerView.findViewById<View>(R.id.exo_rotate)
+        val screenButton = playerView.findViewById<View>(R.id.exo_screen)
+        val episodeButton = playerView.findViewById<View>(R.id.exo_ep_sel_btn)
+
         autoplayButton.nextFocusLeftId = R.id.exo_back
         autoplayButton.nextFocusRightId = R.id.exo_skip_op_ed
-        exoSpeed.nextFocusLeftId = R.id.exo_skip_op_ed
-        exoSpeed.nextFocusRightId = R.id.exo_settings
-        exoSettings.nextFocusLeftId = androidx.media3.ui.R.id.exo_playback_speed
-        exoSettings.nextFocusRightId = R.id.exo_tracks
-        tracksButton.nextFocusLeftId = R.id.exo_settings
-        tracksButton.nextFocusRightId = R.id.exo_back
+        autoplayButton.nextFocusDownId = androidx.media3.ui.R.id.exo_play
+
+        exoSpeed.nextFocusLeftId = R.id.exo_screen
+        exoSpeed.nextFocusRightId =
+            if (exoSubtitle.isVisible) R.id.exo_sub else R.id.exo_source
+        exoSpeed.nextFocusUpId = R.id.exo_skip
+
+        exoSettings.nextFocusLeftId = R.id.exo_skip_op_ed
+        exoSettings.nextFocusRightId = R.id.exo_ep_sel_btn
+        exoSettings.nextFocusDownId = androidx.media3.ui.R.id.exo_play
+
+        episodeButton.nextFocusLeftId = R.id.exo_settings
+        episodeButton.nextFocusRightId = R.id.exo_back
+        episodeButton.nextFocusDownId = androidx.media3.ui.R.id.exo_play
+        episodeButton.nextFocusUpId = R.id.exo_skip
+
+        tracksButton.nextFocusLeftId = R.id.exo_source
+        tracksButton.nextFocusRightId = R.id.exo_rotate
+        tracksButton.nextFocusUpId = androidx.media3.ui.R.id.exo_progress
+
+        sourceButton.nextFocusLeftId =
+            if (exoSubtitle.isVisible) R.id.exo_sub else androidx.media3.ui.R.id.exo_playback_speed
+        sourceButton.nextFocusRightId =
+            if (tracksButton.isVisible) R.id.exo_tracks else R.id.exo_rotate
+        sourceButton.nextFocusUpId = androidx.media3.ui.R.id.exo_progress
+
+        subButton.nextFocusLeftId = androidx.media3.ui.R.id.exo_playback_speed
+        subButton.nextFocusRightId = R.id.exo_source
+        subButton.nextFocusUpId = androidx.media3.ui.R.id.exo_progress
+
+        rotateButton.nextFocusLeftId = if (tracksButton.isVisible) R.id.exo_tracks else R.id.exo_source
+        rotateButton.nextFocusRightId = R.id.exo_screen
+        rotateButton.nextFocusUpId = R.id.exo_skip
+
+        screenButton.nextFocusLeftId = R.id.exo_rotate
+        screenButton.nextFocusRightId = androidx.media3.ui.R.id.exo_playback_speed
+        screenButton.nextFocusUpId = R.id.exo_skip
+
         exoBack.nextFocusRightId = R.id.exo_ep_sel_text
         exoBack.nextFocusLeftId = R.id.exo_autoplay
         playerView.findViewById<View>(R.id.exo_prev_ep).nextFocusLeftId = R.id.exo_back
@@ -1052,8 +1164,6 @@ class ExoplayerView :
         exoPlay.nextFocusRightId = R.id.exo_next_ep
         playerView.findViewById<View>(R.id.exo_next_ep).nextFocusLeftId = androidx.media3.ui.R.id.exo_play
         exoPlay.nextFocusUpId = R.id.exo_autoplay
-        exoSpeed.nextFocusDownId = androidx.media3.ui.R.id.exo_play
-        autoplayButton.nextFocusDownId = androidx.media3.ui.R.id.exo_play
 
         val progressBar = playerView.findViewById<DefaultTimeBar>(androidx.media3.ui.R.id.exo_progress)
         progressBar.isFocusable = true
@@ -1083,9 +1193,10 @@ class ExoplayerView :
         skipTimeButton.nextFocusRightId = R.id.exo_rotate
         skipTimeButton.nextFocusLeftId = R.id.exo_skip_op_ed
         skipTimeButton.nextFocusUpId = R.id.exo_settings
-        playerView.findViewById<View>(R.id.exo_ep_sel_btn).nextFocusLeftId = R.id.exo_screen
-        playerView.findViewById<View>(R.id.exo_ep_sel_btn).nextFocusUpId = R.id.exo_skip
         progressBar.setOnFocusChangeListener { _, hasFocus ->
+            if (!hasFocus && seekPreviewMode) {
+                endSeekPreview(apply = false, fromTouch = false)
+            }
             if (PrefManager.getVal<Boolean>(PrefName.AnimationsEnabled) && PrefManager.getVal<Boolean>(PrefName.SeekBarAnimations)) {
                 progressBar.animate().scaleY(if (hasFocus) 2.5f else 1f).setDuration(150).start()
             } else {
@@ -1126,20 +1237,22 @@ class ExoplayerView :
                         R.id.exo_fast_forward_button, R.id.exo_fast_rewind_button,
                         R.id.exo_skip_timestamp, R.id.exo_ep_sel_btn, R.id.exo_tracks, R.id.exo_autoplay
                     )
-                    if (currentFocus?.id !in controllerButtonIds) {
+                    if (!isAnyRailOpen() && currentFocus?.id !in controllerButtonIds) {
                         exoPlay.requestFocus()
                     }
                 }
                 if (visibility == View.GONE) {
                     playerView.findViewById<View>(R.id.exo_controller).clearFocus()
 
-                    playerView.post {
+                    if (!isAnyRailOpen()) {
+                        playerView.post {
 
-                        if (!playerView.isControllerFullyVisible) {
-                            playerView.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
-                            playerView.isFocusable = true
-                            playerView.requestFocus()
-                            playerView.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+                            if (!playerView.isControllerFullyVisible && !isAnyRailOpen()) {
+                                playerView.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+                                playerView.isFocusable = true
+                                playerView.requestFocus()
+                                playerView.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+                            }
                         }
                     }
                     hideSystemBars()
@@ -1656,33 +1769,131 @@ class ExoplayerView :
         buildRailSeasonChips()
 
         fun change(index: Int) {
-            if (isInitialized) {
-                changingServer = false
-                PrefManager.setCustomVal(
-                    "${media.id}_${episodeArr[currentEpisodeIndex]}",
-                    exoPlayer.currentPosition,
-                )
-                val prev = episodeArr[currentEpisodeIndex]
+            if (!isInitialized) return
+            changingServer = false
+            val prev = episodes.getEpisodeKey(media.anime?.selectedEpisode)
+                ?: episodeArr.getOrNull(currentEpisodeIndex)
+            if (prev != null) {
+                val currentPos = if (playerReleased) 0L else exoPlayer.currentPosition
+                PrefManager.setCustomVal("${media.id}_$prev", currentPos)
+            }
+            val nextKey = episodeArr.getOrNull(index) ?: return
+            val nextEp = episodes[nextKey] ?: return
 
-                clearAllTransientSubtitleCache()
-                isTimeStampsLoaded = false
-                timeStampsLoading = false
-                lastTimeStampAttempt = 0L
-                lastLoggedStampId = null
-                Logger.log("Player: episode change -> reset timestamps state for ep '${episodeArr[index]}'")
-                episodeLength = 0f
-                simklAddedToWatchlist = false
-                media.anime!!.selectedEpisode = episodeArr[index]
-                model.setMedia(media)
-                model.epChanged.postValue(false)
-                model.setEpisode(episodes[media.anime!!.selectedEpisode!!]!!, "change")
-                model.onEpisodeClick(
-                    media,
-                    media.anime!!.selectedEpisode!!,
-                    this.supportFragmentManager,
-                    false,
-                    prev,
+            clearAllTransientSubtitleCache()
+            isTimeStampsLoaded = false
+            timeStampsLoading = false
+            lastTimeStampAttempt = 0L
+            lastLoggedStampId = null
+            Logger.log("Player: episode change -> reset timestamps state for ep '$nextKey'")
+            episodeLength = 0f
+            simklAddedToWatchlist = false
+
+            val selected = model.loadSelected(media)
+            media.selected = selected
+            val requiredServer = episode?.selectedExtractor
+                ?: selected.server
+                ?: extractor?.server?.name
+
+            if (!PrefManager.getVal<Boolean>(PrefName.MakeDefault) || requiredServer == null) {
+                autoContinuePending = false
+                autoContinueServer = null
+                if (isInitialized) exoPlayer.pause()
+                val controller = serverRailController
+                Logger.log(
+                    "Player: episode change -> no identical server for ep '$nextKey', opening rail",
                 )
+                if (controller != null) {
+                    controller.openForEpisode(nextKey)
+                } else {
+                    media.anime!!.selectedEpisode = nextKey
+                    model.setMedia(media)
+                    toast(getString(R.string.source_error))
+                }
+                return
+            }
+
+            autoContinuePending = true
+            autoContinueServer = requiredServer
+            media.anime!!.selectedEpisode = nextKey
+            model.setMedia(media)
+            model.epChanged.value = true
+            if (isInitialized) exoPlayer.pause()
+
+            if (TmdbStreamResolver.sessionFor(media.id) != null) {
+                val prevVideo = episode?.selectedVideo ?: 0
+                val preloaded = nextEp.extractorsSource != null && nextEp.allStreams &&
+                    nextEp.extractors?.any {
+                        it.server.name == requiredServer && it.videos.isNotEmpty()
+                    } == true
+                autoContinuePending = false
+                autoContinueServer = null
+                val chosen = if (preloaded) {
+                    nextEp.extractors
+                        ?.filterNotNull()
+                        ?.firstOrNull {
+                            it.server.name == requiredServer && it.videos.isNotEmpty()
+                        }
+                } else {
+                    null
+                }
+                if (chosen != null) {
+                    nextEp.selectedExtractor = chosen.server.name
+                    nextEp.selectedVideo = prevVideo.coerceIn(
+                        0,
+                        (chosen.videos.size - 1).coerceAtLeast(0),
+                    )
+                    Logger.log(
+                        "Player: preloaded tmdb server '$requiredServer' on ep " +
+                            "'${nextEp.number}' — playing",
+                    )
+                    model.setEpisode(nextEp, "change")
+                } else {
+                    Logger.log(
+                        "Player: tmdb server '$requiredServer' not preloaded for ep " +
+                            "'${nextEp.number}' — opening source rail",
+                    )
+                    val controller = serverRailController
+                    if (controller != null) {
+                        controller.openForEpisode(
+                            nextKey,
+                            preferredServer = requiredServer,
+                            autoPlay = true,
+                        )
+                    } else {
+                        toast(getString(R.string.source_error))
+                    }
+                }
+            } else {
+                val preloaded = nextEp.extractorsSource == selected.sourceIndex &&
+                    nextEp.extractors?.any {
+                        it.server.name == requiredServer && it.videos.isNotEmpty()
+                    } == true
+                autoContinuePending = false
+                autoContinueServer = null
+                if (preloaded) {
+                    nextEp.selectedExtractor = requiredServer
+                    nextEp.selectedVideo = selected.video
+                    Logger.log(
+                        "Player: preloaded server '$requiredServer' on ep '${nextEp.number}' — playing",
+                    )
+                    model.setEpisode(nextEp, "change")
+                } else {
+                    Logger.log(
+                        "Player: server '$requiredServer' not preloaded for ep " +
+                            "'${nextEp.number}' — opening source rail",
+                    )
+                    val controller = serverRailController
+                    if (controller != null) {
+                        controller.openForEpisode(
+                            nextKey,
+                            preferredServer = requiredServer,
+                            autoPlay = true,
+                        )
+                    } else {
+                        toast(getString(R.string.source_error))
+                    }
+                }
             }
         }
 
@@ -1717,7 +1928,6 @@ class ExoplayerView :
                     episodeDrawer.closeDrawer(episodeDrawerContent)
                     disappeared = false
                     functionstarted = false
-                    currentEpisodeIndex = idx
                     change(idx)
                 }
             },
@@ -1894,16 +2104,8 @@ class ExoplayerView :
         preloading = false
         val incognito: Boolean = PrefManager.getVal(PrefName.Incognito)
         val showProgressDialog =
-            if (PrefManager.getVal<Boolean>(PrefName.AutoTrackNewShows)) {
-                false
-            } else if (PrefManager.getVal(PrefName.AskIndividualPlayer)) {
-                PrefManager.getCustomVal(
-                    "${media.id}_progressDialog",
-                    true,
-                )
-            } else {
-                false
-            }
+            PrefManager.getVal<Int>(PrefName.ProgressUpdateMode).coerceIn(0, 2) == 1 &&
+                PrefManager.getCustomVal("${media.id}_progressDialog", true)
 
         val isTmdbContent = media.id < 0
         val shouldShowDialog = if (isLiveStream()) {
@@ -2031,15 +2233,27 @@ class ExoplayerView :
             ?.filter { it.videos.isNotEmpty() }
             .orEmpty()
 
-        val ext = availableExtractors.find { it.server.name == episode.selectedExtractor }
-            ?: availableExtractors.firstOrNull { it.isPreferred }
-            ?: availableExtractors.firstOrNull()
+        val ext = if (autoContinuePending) {
+            autoContinueServer?.let { required ->
+                availableExtractors.firstOrNull { it.server.name == required }
+            }
+        } else {
+            availableExtractors.find { it.server.name == episode.selectedExtractor }
+                ?: availableExtractors.firstOrNull { it.isPreferred }
+                ?: availableExtractors.firstOrNull()
+        }
         if (ext == null) {
             Logger.log(
                 Log.ERROR,
                 "Player: no extractor '${episode.selectedExtractor}' on ep '${episode.number}' " +
                     "(have ${episode.extractors?.filterNotNull()?.size ?: 0}) — aborting media build"
             )
+            autoContinuePending = false
+            autoContinueServer = null
+            toast(getString(R.string.source_error))
+            val failedKey = media.anime?.selectedEpisode
+            if (failedKey != null) serverRailController?.openForEpisode(failedKey)
+            else serverRailController?.open()
             return
         }
         extractor = ext
@@ -2052,8 +2266,16 @@ class ExoplayerView :
                 "Player: no video at index ${episode.selectedVideo} for server '${ext.server.name}' " +
                     "(videos=${ext.videos.size}) on ep '${episode.number}' — aborting media build"
             )
+            autoContinuePending = false
+            autoContinueServer = null
+            toast(getString(R.string.source_error))
+            val failedKey = media.anime?.selectedEpisode
+            if (failedKey != null) serverRailController?.openForEpisode(failedKey)
+            else serverRailController?.open()
             return
         }
+        autoContinuePending = false
+        autoContinueServer = null
 
         if (episode.selectedExtractor != ext.server.name) {
             episode.selectedExtractor = ext.server.name
@@ -2175,10 +2397,7 @@ class ExoplayerView :
             exoSubtitle.setOnClickListener {
                 subClick()
             }
-            
-            
-            playerView.findViewById<DefaultTimeBar>(androidx.media3.ui.R.id.exo_progress)
-                ?.nextFocusDownId = R.id.exo_sub
+            refreshBottomBarFocusLinks()
         }
         val sub: MutableList<MediaItem.SubtitleConfiguration> =
             emptyList<MediaItem.SubtitleConfiguration>().toMutableList()
@@ -2200,7 +2419,9 @@ class ExoplayerView :
                 }
                 lifecycleScope.launch(Dispatchers.IO) {
                     try {
-                        val client = okhttp3.OkHttpClient()
+                        val client = okhttp3.OkHttpClient.Builder()
+                            .dns(okHttpClient.dns)
+                            .build()
                         val request = okhttp3.Request.Builder().url(extSubUrl).build()
                         val response = client.newCall(request).execute()
                         if (response.isSuccessful) {
@@ -2263,6 +2484,7 @@ class ExoplayerView :
                 .apply {
 
                     cookieJar(okHttpClient.cookieJar)
+                    dns(okHttpClient.dns)
                     ignoreAllSSLErrors()
                     followRedirects(true)
                     followSslRedirects(true)
@@ -2442,6 +2664,12 @@ class ExoplayerView :
         }
 
         mediaItem = mediaItemBuilder.build()
+        previewMediaItem =
+            MediaItem
+                .Builder()
+                .setUri(video!!.file.url)
+                .setMimeType(mimeType)
+                .build()
 
         Logger.log(
             "Player: building media source url=${video!!.file.url.take(200)} " +
@@ -2494,8 +2722,10 @@ class ExoplayerView :
                 .setMatroskaExtractorFlags(androidx.media3.extractor.mkv.MatroskaExtractor.FLAG_DISABLE_SEEK_FOR_CUES)
                 .withAssMkvSupport(AssSubtitleParserFactory(assHandler!!), assHandler!!)
             DefaultMediaSourceFactory(localDataSourceFactory, localExtractorsFactory)
+                .also { previewSourceFactory = it }
                 .createMediaSource(mediaItem)
         } else {
+            previewSourceFactory = assMediaSourceFactory
             assMediaSourceFactory
                 .createMediaSource(mediaItem)
         }
@@ -2572,6 +2802,25 @@ class ExoplayerView :
         }
     }
 
+    private fun videoDecoderSelector(mode: Int): MediaCodecSelector =
+        MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
+            val infos = MediaCodecSelector.DEFAULT.getDecoderInfos(
+                mimeType,
+                requiresSecureDecoder,
+                requiresTunnelingDecoder,
+            )
+            if (!mimeType.startsWith("video/")) {
+                infos
+            } else {
+                when (mode) {
+                    0 -> infos.filter { it.hardwareAccelerated }
+                    1 -> infos.filter { it.hardwareAccelerated } +
+                        infos.filterNot { it.hardwareAccelerated }
+                    else -> infos.filterNot { it.hardwareAccelerated }
+                }
+            }
+        }
+
     private fun buildExoplayer() {
 
         renderCustomSubtitle("", "")
@@ -2582,21 +2831,23 @@ class ExoplayerView :
         liveReconnectCount = 0
         liveRecoveryFailed = false
 
-        val bufferSize = PrefManager.getVal<Int>(PrefName.BufferSize)
-        val minBufferMs = bufferSize * 1000
-        val maxBufferMs = bufferSize * 2000
+        val bufferDurationMs = PrefManager.getVal<Int>(PrefName.BufferDurationSeconds)
+            .coerceIn(10, 180) * 1000
+        val bufferTargetBytes = PrefManager.getVal<Int>(PrefName.BufferTargetMb)
+            .coerceIn(32, 512) * 1024 * 1024
+        val backBufferMs = min(BACK_BUFFER_DURATION_MS, bufferDurationMs)
         val loadControl =
             DefaultLoadControl
                 .Builder()
-                .setBackBuffer(BACK_BUFFER_DURATION_MS, false)
+                .setBackBuffer(backBufferMs, false)
                 .setBufferDurationsMs(
-                    minBufferMs,
-                    maxBufferMs,
+                    bufferDurationMs,
+                    bufferDurationMs,
                     BUFFER_FOR_PLAYBACK_MS,
                     BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,
                 )
-                .setTargetBufferBytes(androidx.media3.common.C.LENGTH_UNSET)
-                .setPrioritizeTimeOverSizeThresholds(true)
+                .setTargetBufferBytes(bufferTargetBytes)
+                .setPrioritizeTimeOverSizeThresholds(false)
                 .build()
 
         hideSystemBars()
@@ -2620,8 +2871,10 @@ class ExoplayerView :
         val alreadyHandled = storedSource == "manual" || storedSource == "auto"
         speechRecorder.setEnabled(autoSyncPrefEnabled && !alreadyHandled)
         Logger.log("Libass: Calling SubtitleSyncRenderersFactory.withAssSupport()")
+        val decoderMode = PrefManager.getVal<Int>(PrefName.DecodingMode).coerceIn(0, 2)
         val renderersFactory = SubtitleSyncRenderersFactory(this, speechRecorder)
-            .setEnableDecoderFallback(false)
+            .setMediaCodecSelector(videoDecoderSelector(decoderMode))
+            .setEnableDecoderFallback(decoderMode != 0)
             .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
             .withAssSupport(handler)
 
@@ -2774,7 +3027,7 @@ class ExoplayerView :
                         exoSubtitleView.visibility = View.GONE
 
                         if (syncActive || hasOverlappingCues) {
-                            renderCustomSubtitleTexts(activeCues.map { it.text })
+                            renderCustomSubtitleCues(activeCues)
                             return
                         }
 
@@ -2839,6 +3092,7 @@ class ExoplayerView :
         }
 
         isInitialized = true
+        playerReleased = false
 
         if (!hasExtSubtitles && !PrefManager.getVal<Boolean>(PrefName.Subtitles)) {
             onSetTrackGroupOverride(dummyTrack, TRACK_TYPE_TEXT)
@@ -2859,6 +3113,8 @@ class ExoplayerView :
     }
 
     private fun releasePlayer() {
+        cancelSeekPreviewUi()
+        seekPreviewController?.clear()
         val wasLive = liveSupportRegistered || liveDetectedFromPlayer || isDeclaredLiveStream()
         if (wasLive) {
             Logger.log(
@@ -2875,8 +3131,8 @@ class ExoplayerView :
         LiveHelper.unregisterPlayer(exoPlayer)
         liveSupportRegistered = false
         exoPlayer.release()
-        VideoCache.release()
         mediaSession?.release()
+        playerReleased = true
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -2890,21 +3146,28 @@ class ExoplayerView :
     }
 
     private fun sourceClick() {
-        Logger.log("Player: sourceClick — opening source selector (server=${media.selected?.server ?: "none"}, ep=${episode.number})")
-        changingServer = true
-
-        media.selected!!.server = null
+        Logger.log("Player: sourceClick — opening server rail (server=${media.selected?.server ?: "none"}, ep=${episode.number})")
+        val controller = serverRailController
         PrefManager.setCustomVal(
             "${media.id}_${media.anime!!.selectedEpisode}",
             exoPlayer.currentPosition,
         )
-        model.saveSelected(media.id, media.selected!!)
-        model.onEpisodeClick(
-            media,
-            episode.number,
-            this.supportFragmentManager,
-            launch = false,
-        )
+        if (controller != null) {
+            controller.open()
+        } else {
+            toast(getString(R.string.source_error))
+        }
+    }
+
+    fun restartWithServer(savePosition: Boolean = true) {
+        if (savePosition && !playerReleased) {
+            PrefManager.setCustomVal(
+                "${media.id}_${media.anime!!.selectedEpisode}",
+                exoPlayer.currentPosition,
+            )
+        }
+        recreating = true
+        recreate()
     }
 
     private fun silentLiveReconnect() {
@@ -3402,7 +3665,34 @@ class ExoplayerView :
     }
 
     private fun parseVTT(content: String): List<SyncCue> {
-        return parseSRT(content)
+        val cues = mutableListOf<SyncCue>()
+        for (block in content.split(Regex("\n\n+"))) {
+            val lines = block.trim().lines()
+            if (lines.size < 2) continue
+            val timeIdx = lines.indexOfFirst { it.contains("-->") }
+            if (timeIdx == -1) continue
+            val m = timeLineRegex.find(lines[timeIdx]) ?: continue
+            val start = parseSRTTime("${m.groupValues[1]},${m.groupValues[2]}")
+            val end = parseSRTTime("${m.groupValues[3]},${m.groupValues[4]}")
+            val text = lines.drop(timeIdx + 1).joinToString("\n").trim()
+            if (text.isBlank()) continue
+            val settings = lines[timeIdx].substringAfter("-->", "").trim().substringAfter(' ', "")
+            cues.add(
+                SyncCue(
+                    text = cleanSubtitleText(text),
+                    startTimeMs = start,
+                    durationMs = (end - start).coerceAtLeast(1000),
+                    isTop = vttCueIsTop(settings),
+                )
+            )
+        }
+        return cues
+    }
+
+    private fun vttCueIsTop(settings: String): Boolean {
+        val line = Regex("""line:(\d+(?:\.\d+)?)%""").find(settings)?.groupValues?.getOrNull(1)
+            ?.toFloatOrNull()
+        return line != null && line <= 40f
     }
 
     private fun parseASS(content: String): List<SyncCue> {
@@ -3492,6 +3782,12 @@ class ExoplayerView :
             if (posMs < cue.startTimeMs + cue.durationMs) active.add(cue)
         }
         return active
+    }
+
+    private fun renderCustomSubtitleCues(cues: List<SyncCue>) {
+        val top = cues.filter { it.isTop }.map { it.text.trim() }.filter { it.isNotEmpty() }
+        val bottom = cues.filterNot { it.isTop }.map { it.text.trim() }.filter { it.isNotEmpty() }
+        renderCustomSubtitle(top.joinToString("\n"), bottom.joinToString("\n"))
     }
 
     private fun renderCustomSubtitleTexts(texts: List<String>) {
@@ -3873,7 +4169,9 @@ class ExoplayerView :
                 android.util.Log.d("ExoplayerView", "applyOnlineSubtitle: Downloading subtitle from $resolvedUrl")
                 Logger.log("applyOnlineSubtitle: resolved url=$resolvedUrl")
 
-                val client = okhttp3.OkHttpClient()
+                val client = okhttp3.OkHttpClient.Builder()
+                    .dns(okHttpClient.dns)
+                    .build()
                 val request = okhttp3.Request.Builder()
                     .url(resolvedUrl)
                     .apply {
@@ -4188,10 +4486,15 @@ class ExoplayerView :
     }
 
     private fun schedulePauseOverlayTimer() {
+        if (seekPreviewMode) return
         pauseMetadataTimer?.let { handler.removeCallbacks(it) }
         if (!isPlayerPlaying) {
             val timer = Runnable {
                 if (!isPlayerPlaying && !isBuffering) {
+                    if (isAnyRailOpen()) {
+                        schedulePauseOverlayTimer()
+                        return@Runnable
+                    }
                     pauseOverlay.visibility = View.VISIBLE
                     pauseOverlay.alpha = 0f
                     if (PrefManager.getVal<Boolean>(PrefName.AnimationsEnabled) && PrefManager.getVal<Boolean>(PrefName.PlayerOverlayAnimations)) {
@@ -4236,7 +4539,7 @@ class ExoplayerView :
         }
 
         val incognito = PrefManager.getVal<Boolean>(PrefName.Incognito)
-        val simklProgressEnabled = PrefManager.getCustomVal("${media.id}_save_progress", true)
+        val simklProgressEnabled = progressSavingEnabled(media.id)
         if (!isLiveStream() && Simkl.token != null && media.id < 0 && !incognito && simklProgressEnabled) {
 
             val playerCurrentPosition = if (::exoPlayer.isInitialized) exoPlayer.currentPosition else 0L
@@ -4377,18 +4680,40 @@ class ExoplayerView :
             ) {
                 preloading = true
                 nextEpisode(false) { i ->
-                    val ep = episodes[episodeArr[currentEpisodeIndex + i]] ?: return@nextEpisode
+                    val nextKey = episodeArr[currentEpisodeIndex + i] ?: return@nextEpisode
+                    val ep = episodes[nextKey] ?: return@nextEpisode
                     val selected = media.selected ?: return@nextEpisode
                     lifecycleScope.launch(Dispatchers.IO) {
                         if (TmdbStreamResolver.sessionFor(media.id) != null) {
-
                             ani.sanin.cloudstream.TmdbStreamResolver.populateSyntheticEpisode(
                                 this@ExoplayerView, media, ep
                             )
-                        } else if (media.selected!!.server != null) {
-                            model.loadEpisodeSingleVideo(ep, selected, false)
                         } else {
-                            model.loadEpisodeVideos(ep, selected.sourceIndex, false)
+                            val sourceEp = model.episodeForSource(
+                                media,
+                                selected.sourceIndex,
+                                nextKey,
+                                ep.number,
+                            )
+                            if (sourceEp == null) {
+                                Logger.log(
+                                    "Player: no episode '$nextKey' on source " +
+                                        "${selected.sourceIndex} — skipping preload",
+                                )
+                                return@launch
+                            }
+                            withContext(Dispatchers.Main) {
+                                if (isFinishing || isDestroyed) return@withContext
+                                if (sourceEp !== ep) {
+                                    sourceEp.selectedSubtitle = ep.selectedSubtitle
+                                    episodes[nextKey] = sourceEp
+                                }
+                            }
+                            if (selected.server != null) {
+                                model.loadEpisodeSingleVideo(sourceEp, selected, false)
+                            } else {
+                                model.loadEpisodeVideos(sourceEp, selected.sourceIndex, false)
+                            }
                         }
                     }
                 }
@@ -4406,15 +4731,19 @@ class ExoplayerView :
         else episodes.filterValues { it.extra?.get("season") == currentRailSeason }
 
     private fun buildRailSeasonChips() {
+        val focusedSeason = railSeasonChips.findFocus()?.tag as? Int
         railSeasonChips.removeAllViews()
         if (seasonArr.size <= 1) {
             railSeasonScroll.isVisible = false
+            episodeDrawerClose.nextFocusDownId = R.id.episodeDrawerList
             return
         }
         railSeasonScroll.isVisible = true
+        val chips = mutableListOf<Chip>()
         seasonArr.forEach { season ->
             val chip = LayoutInflater.from(this)
                 .inflate(R.layout.item_tmdb_chip, railSeasonChips, false) as Chip
+            chip.id = View.generateViewId()
             chip.text = getString(R.string.tmdb_watch_season_chip, season)
             chip.isCheckable = true
             chip.isClickable = true
@@ -4430,6 +4759,22 @@ class ExoplayerView :
             }
             FocusEffectUtil.applyFocusListener(chip)
             railSeasonChips.addView(chip)
+            chips.add(chip)
+        }
+        chips.forEachIndexed { index, chip ->
+            chip.nextFocusLeftId = if (index == 0) chip.id else chips[index - 1].id
+            chip.nextFocusRightId = if (index == chips.lastIndex) chip.id else chips[index + 1].id
+            chip.nextFocusUpId = episodeDrawerClose.id
+            chip.nextFocusDownId = R.id.episodeDrawerList
+            chip.setOnKeyListener { _, keyCode, event ->
+                event.action == KeyEvent.ACTION_DOWN &&
+                    ((keyCode == KeyEvent.KEYCODE_DPAD_LEFT && index == 0) ||
+                        (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT && index == chips.lastIndex))
+            }
+        }
+        episodeDrawerClose.nextFocusDownId = chips.firstOrNull()?.id ?: R.id.episodeDrawerList
+        if (focusedSeason != null) {
+            chips.firstOrNull { it.tag == focusedSeason }?.requestFocus()
         }
     }
 
@@ -4516,6 +4861,8 @@ class ExoplayerView :
             timeStampText.text = ""
             exoSkipOpEd.visibility = View.GONE
             (exoSkipOpEd.parent as? ViewGroup)?.requestLayout()
+            playerView.findViewById<View>(R.id.exo_autoplay)?.nextFocusRightId = R.id.exo_settings
+            exoSettings.nextFocusLeftId = R.id.exo_autoplay
             hideSkipTimestampButton()
             updateTimelineUi()
             handler.postDelayed({
@@ -4651,8 +4998,7 @@ class ExoplayerView :
         exoSkip.visibility = View.GONE
         exoRotate.nextFocusUpId = R.id.exo_skip_timestamp
         exoScreen.nextFocusUpId = R.id.exo_skip_timestamp
-        playerView.findViewById<View>(R.id.exo_ep_sel_btn)?.nextFocusUpId =
-            R.id.exo_skip_timestamp
+        exoSpeed.nextFocusUpId = R.id.exo_skip_timestamp
     }
 
     private fun hideSkipTimestampButton() {
@@ -4667,8 +5013,7 @@ class ExoplayerView :
         }
         exoRotate.nextFocusUpId = R.id.exo_skip
         exoScreen.nextFocusUpId = R.id.exo_skip
-        playerView.findViewById<View>(R.id.exo_ep_sel_btn)?.nextFocusUpId =
-            if (exoSkip.visibility == View.VISIBLE) R.id.exo_skip else androidx.media3.ui.R.id.exo_progress
+        exoSpeed.nextFocusUpId = R.id.exo_skip
     }
 
     fun onSetTrackGroupOverride(
@@ -4709,17 +5054,6 @@ class ExoplayerView :
 
     fun playerCurrentTracks(): Tracks = if (isInitialized) exoPlayer.currentTracks else Tracks.EMPTY
 
-    fun closeTracksRail() {
-        playerView.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
-        playerView.isFocusable = true
-        trackRailController?.close()
-        if (!tracksHidden) {
-            if (playerTracksBtn?.requestFocus() != true) exoPlay.requestFocus()
-        } else {
-            exoPlay.requestFocus()
-        }
-    }
-
     fun subtitleRailHasExtSubtitles(): Boolean = hasExtSubtitles
 
     fun subtitleRailEmbeddedTracks(): List<Tracks.Group> = embeddedSubTracks
@@ -4749,18 +5083,34 @@ class ExoplayerView :
 
         (btn.parent as? ViewGroup)?.requestLayout()
 
-        val skipUpId = if (show) R.id.exo_tracks else R.id.exo_settings
-        playerView.findViewById<View>(R.id.exo_skip)?.nextFocusUpId = skipUpId
-        playerView.findViewById<View>(R.id.exo_skip_timestamp)?.nextFocusUpId = skipUpId
-        val epBtn = playerView.findViewById<View>(R.id.exo_ep_sel_btn)
-        if (show) {
-            epBtn.nextFocusRightId = R.id.exo_tracks
-        } else {
-            epBtn.nextFocusRightId = View.NO_ID
-            if (btn.hasFocus()) {
-                epBtn.requestFocus()
-            }
+        playerView.findViewById<View>(R.id.exo_skip)?.nextFocusUpId = R.id.exo_settings
+        playerView.findViewById<View>(R.id.exo_skip_timestamp)?.nextFocusUpId = R.id.exo_settings
+        refreshBottomBarFocusLinks()
+        if (!show && btn.hasFocus()) {
+            exoSpeed.requestFocus()
         }
+    }
+
+    private fun refreshBottomBarFocusLinks() {
+        if (!::playerView.isInitialized) return
+        val subVisible = ::exoSubtitle.isInitialized && exoSubtitle.isVisible
+        val tracksVisible = playerView.findViewById<View>(R.id.exo_tracks)?.isVisible == true
+        if (::exoSource.isInitialized) {
+            exoSource.nextFocusLeftId =
+                if (subVisible) R.id.exo_sub else androidx.media3.ui.R.id.exo_playback_speed
+            exoSource.nextFocusRightId =
+                if (tracksVisible) R.id.exo_tracks else R.id.exo_rotate
+        }
+        if (::exoSpeed.isInitialized) {
+            exoSpeed.nextFocusRightId =
+                if (subVisible) R.id.exo_sub else R.id.exo_source
+        }
+        if (::exoRotate.isInitialized) {
+            exoRotate.nextFocusLeftId =
+                if (tracksVisible) R.id.exo_tracks else R.id.exo_source
+        }
+        playerView.findViewById<DefaultTimeBar>(androidx.media3.ui.R.id.exo_progress)
+            ?.nextFocusDownId = if (subVisible) R.id.exo_sub else R.id.exo_source
     }
 
     fun setSubtitlesEnabled(enabled: Boolean) {
@@ -4855,7 +5205,7 @@ class ExoplayerView :
             emptyList()
         }
         updateTracksButton(tracks)
-        trackRailController?.rebuild()
+        serverRailController?.notifyTracksChanged()
         exoAudioTrack.isVisible = audioTracks.size > 1
         exoAudioTrack.setOnClickListener {
             Logger.log("Player: AUDIO TRACK pressed — ${audioTracks.size} tracks available")
@@ -4877,6 +5227,7 @@ class ExoplayerView :
             exoSubtitle.setOnClickListener {
                 subClick()
             }
+            refreshBottomBarFocusLinks()
         }
         updateAudioLanguageInfo()
     }
@@ -5274,6 +5625,7 @@ class ExoplayerView :
             }
 
             maybeLoadTimeStamps("ready")
+            setupSeekPreviewForSource()
             updateLiveBadge()
             if (isLiveStream()) updateTimelineUi()
         }
@@ -5291,7 +5643,8 @@ class ExoplayerView :
             if (!isLiveStream()) clearAllTransientSubtitleCache()
             if (!isLiveStream() && PrefManager.getVal(PrefName.AutoPlay)) {
                 val browsingEpisodes =
-                    episodeDrawer.isDrawerOpen(episodeDrawerContent) ||
+                    isAnyRailOpen() ||
+                        episodeDrawer.isDrawerOpen(episodeDrawerContent) ||
                         episodeCommentPanel.visibility == View.VISIBLE
                 if (browsingEpisodes) {
                     Logger.log("Player: ENDED while browsing episodes, autoplay deferred")
@@ -5305,6 +5658,13 @@ class ExoplayerView :
         super.onPlaybackStateChanged(playbackState)
     }
 
+    private fun progressSavingEnabled(id: Int): Boolean =
+        when (PrefManager.getVal<Int>(PrefName.ProgressUpdateMode).coerceIn(0, 2)) {
+            0 -> true
+            2 -> false
+            else -> PrefManager.getCustomVal("${id}_save_progress", true)
+        }
+
     private fun updateAniProgress() {
         val incognito: Boolean = PrefManager.getVal(PrefName.Incognito)
 
@@ -5313,7 +5673,7 @@ class ExoplayerView :
         }
 
         if (media.id < 0) {
-            val saveProgress = PrefManager.getCustomVal("${media.id}_save_progress", true)
+            val saveProgress = progressSavingEnabled(media.id)
             if (episodeLength <= 0f || incognito || Simkl.token == null || !saveProgress) return
             val currentPos = exoPlayer.currentPosition
             val episodeEnd = currentPos / episodeLength > PrefManager.getVal<Float>(PrefName.WatchPercentage)
@@ -5362,10 +5722,7 @@ class ExoplayerView :
             else Anilist.userid != null
         if (!incognito && (episodeEnd || episode0) && trackerReady
         ) {
-            if (PrefManager.getCustomVal(
-                    "${media.id}_save_progress",
-                    true,
-                ) &&
+            if (progressSavingEnabled(media.id) &&
                 (if (media.isAdult) PrefManager.getVal(PrefName.UpdateForHPlayer) else true)
             ) {
                 if (episode0 && !episodeEnd) {
@@ -5451,8 +5808,8 @@ class ExoplayerView :
     @SuppressLint("UnsafeIntentLaunch")
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        finishAndRemoveTask()
-        startActivity(intent)
+        recreating = true
+        recreate()
     }
 
     override fun onDestroy() {
@@ -5478,11 +5835,13 @@ class ExoplayerView :
             functionstarted = false
             releasePlayer()
         }
+        seekPreviewController?.close()
+        seekPreviewController = null
         cancelAutoSyncWatcher()
         speechRecorder.release()
 
         super.onDestroy()
-        finishAndRemoveTask()
+        if (!recreating && !isChangingConfigurations) finishAndRemoveTask()
     }
 
     @Suppress("DEPRECATION")
@@ -5563,17 +5922,18 @@ class ExoplayerView :
     }
 
     private fun ensureControllerVisible() {
+        val railOpen = isAnyRailOpen()
         if (pauseOverlay.visibility == View.VISIBLE) {
             pauseOverlay.visibility = View.GONE
             if (!playerView.isControllerFullyVisible) playerView.showController()
             playerView.controllerShowTimeoutMs = PrefManager.getVal<Int>(PrefName.AutoHideTimeout) * 1000
-            playerView.post { exoPlay.requestFocus() }
+            if (!railOpen) playerView.post { exoPlay.requestFocus() }
             return
         }
         val wasHidden = !playerView.isControllerFullyVisible
         if (wasHidden) {
             playerView.showController()
-            playerView.post { exoPlay.requestFocus() }
+            if (!railOpen) playerView.post { exoPlay.requestFocus() }
         } else {
             playerView.showController()
         }
@@ -5582,6 +5942,11 @@ class ExoplayerView :
 
     private fun handleBackPress(): Boolean {
         val now = java.lang.System.currentTimeMillis()
+        if (seekPreviewMode) {
+            endSeekPreview(apply = false, fromTouch = false)
+            backPressTime = now
+            return true
+        }
         if (episodeCommentPanel.visibility == View.VISIBLE) {
             closeEpisodeCommentPanel(returnToRail = true)
             backPressTime = now
@@ -5602,9 +5967,9 @@ class ExoplayerView :
             backPressTime = now
             return true
         }
-        if (this::tracksDrawerContent.isInitialized && trackRailController?.isOpen() == true) {
-            Logger.log("Player handleBackPress: closing tracks rail")
-            closeTracksRail()
+        if (serverRailController?.isOpen() == true) {
+            Logger.log("Player handleBackPress: closing server rail")
+            serverRailController?.close()
             backPressTime = now
             return true
         }
@@ -5617,17 +5982,22 @@ class ExoplayerView :
         }
         if (PrefManager.getVal<Boolean>(PrefName.ConfirmPlayerExit)) {
             val dialogView = layoutInflater.inflate(R.layout.dialog_exit_player, null)
-            val dialog = AlertDialog.Builder(this, R.style.MyPopup)
-                .setView(dialogView)
-                .create()
+            val dialog = android.app.Dialog(this, R.style.MyPopup)
+            dialog.setContentView(dialogView)
+            dialog.setCancelable(true)
             dialogView.findViewById<View>(R.id.exitYes).setOnClickListener {
                 dialog.dismiss()
                 finishAndRemoveTask()
             }
             dialogView.findViewById<View>(R.id.exitNo).setOnClickListener { dialog.dismiss() }
-            dialog.setOnShowListener { dialogView.findViewById<View>(R.id.exitYes).requestFocus() }
+            dialog.setOnShowListener { dialogView.findViewById<View>(R.id.exitNo).requestFocus() }
             dialog.window?.apply {
-                setDimAmount(0.5f)
+                setBackgroundDrawableResource(android.R.color.transparent)
+                setDimAmount(0.6f)
+                setLayout(
+                    (340 * resources.displayMetrics.density).toInt(),
+                    android.view.WindowManager.LayoutParams.WRAP_CONTENT
+                )
                 attributes.windowAnimations = android.R.style.Animation_Dialog
             }
             dialog.show()
@@ -5729,8 +6099,6 @@ class ExoplayerView :
 
     private fun closeEpisodeCommentPanel(returnToRail: Boolean) {
         episodeCommentJob?.cancel()
-        playerView.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
-        playerView.isFocusable = true
         episodeCommentPanel.visibility = View.GONE
         episodeCommentList.visibility = View.GONE
         episodeCommentProgress.visibility = View.GONE
@@ -5739,6 +6107,9 @@ class ExoplayerView :
         if (returnToRail && epKey != null) {
             episodeDrawer.openDrawer(episodeDrawerContent)
             focusRailCommentButton(epKey)
+        } else {
+            playerView.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+            playerView.isFocusable = true
         }
     }
 
@@ -5836,21 +6207,35 @@ class ExoplayerView :
         if (event.action == KeyEvent.ACTION_DOWN) markInteracted()
         if (!isInitialized) return super.dispatchKeyEvent(event)
 
-        if (this::tracksDrawerContent.isInitialized &&
-            trackRailController?.isOpen() == true
-        ) {
+        if (seekPreviewMode) {
             when (event.keyCode) {
-                KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                    if (event.action == KeyEvent.ACTION_DOWN && event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
-                        closeTracksRail()
+                KEYCODE_DPAD_LEFT, KEYCODE_DPAD_RIGHT -> {
+                    if (event.action == KeyEvent.ACTION_DOWN) {
+                        ensureControllerVisible()
+                        playerView.controllerShowTimeoutMs = 0
+                        val step =
+                            PrefManager.getVal<Int>(PrefName.SeekTime).coerceAtLeast(1) * 1000L
+                        val delta = if (event.keyCode == KEYCODE_DPAD_RIGHT) step else -step
+                        updateSeekPreview(seekPreviewPositionMs + delta, fromTouch = false)
+                    }
+                    return true
+                }
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                    if (event.action == KeyEvent.ACTION_UP) {
+                        endSeekPreview(apply = true, fromTouch = false)
                     }
                     return true
                 }
                 KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
                     if (event.action == KeyEvent.ACTION_DOWN) {
-                        closeTracksRail()
+                        endSeekPreview(apply = false, fromTouch = false)
                     }
                     return true
+                }
+                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
+                    if (event.action == KeyEvent.ACTION_DOWN) {
+                        endSeekPreview(apply = false, fromTouch = false)
+                    }
                 }
             }
         }
@@ -5858,14 +6243,38 @@ class ExoplayerView :
         if (this::subtitleDrawerContent.isInitialized && binding.root.isDrawerOpen(subtitleDrawerContent)) {
             when (event.keyCode) {
                 KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                    if (event.action == KeyEvent.ACTION_DOWN && event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
-                        binding.root.closeDrawer(subtitleDrawerContent)
+                    val onActionPill =
+                        currentFocus is com.google.android.material.button.MaterialButton
+                    if (!isSubtitleHeaderFocused() && !onActionPill) {
+                        if (event.action == KeyEvent.ACTION_DOWN && event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
+                            binding.root.closeDrawer(subtitleDrawerContent)
+                        }
+                        return true
                     }
-                    return true
                 }
                 KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
                     if (event.action == KeyEvent.ACTION_DOWN) {
                         binding.root.closeDrawer(subtitleDrawerContent)
+                    }
+                    return true
+                }
+            }
+        }
+
+        if (serverRailController?.isOpen() == true) {
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                    val onClose = currentFocus === serverDrawerClose
+                    if (!onClose && !isRailChipFocused() && !isServerStripFocused() && !isServerTabsFocused()) {
+                        if (event.action == KeyEvent.ACTION_DOWN && event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
+                            serverRailController?.close()
+                        }
+                        return true
+                    }
+                }
+                KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
+                    if (event.action == KeyEvent.ACTION_DOWN) {
+                        serverRailController?.close()
                     }
                     return true
                 }
@@ -5874,7 +6283,8 @@ class ExoplayerView :
 
         if (event.keyCode == KeyEvent.KEYCODE_DPAD_LEFT &&
             (episodeDrawer.isDrawerOpen(episodeDrawerContent) ||
-                episodeCommentPanel.visibility == View.VISIBLE)
+                episodeCommentPanel.visibility == View.VISIBLE) &&
+            !isRailChipFocused()
         ) {
             if (event.action == KeyEvent.ACTION_DOWN) {
                 if (episodeDrawer.isDrawerOpen(episodeDrawerContent) &&
@@ -5894,14 +6304,20 @@ class ExoplayerView :
         if (event.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT &&
             (episodeDrawer.isDrawerOpen(episodeDrawerContent) ||
                 binding.root.isDrawerOpen(subtitleDrawerContent) ||
-                trackRailController?.isOpen() == true)
+                episodeCommentPanel.visibility == View.VISIBLE ||
+                serverRailController?.isOpen() == true)
         ) {
 
             val focused = currentFocus
             val next = focused?.focusSearch(View.FOCUS_RIGHT)
-            if (next == null || !isDescendantOf(next, episodeDrawerContent) && !isDescendantOf(next, subtitleDrawerContent) && !isDescendantOf(next, tracksDrawerContent)) {
-                return true
-            }
+            val inside = next != null && (
+                next === focused ||
+                isDescendantOf(next, episodeDrawerContent) ||
+                isDescendantOf(next, subtitleDrawerContent) ||
+                isDescendantOf(next, serverDrawerContent) ||
+                isDescendantOf(next, episodeCommentPanel)
+            )
+            if (!inside) return true
         }
         if (event.action == KeyEvent.ACTION_DOWN) {
             when (event.keyCode) {
@@ -5915,8 +6331,8 @@ class ExoplayerView :
                     } else if (episodeCommentPanel.visibility == View.VISIBLE) {
                         closeEpisodeCommentPanel(returnToRail = true)
                         return true
-                    } else if (trackRailController?.isOpen() == true) {
-                        closeTracksRail()
+                    } else if (serverRailController?.isOpen() == true) {
+                        serverRailController?.close()
                         return true
                     }
                 }
@@ -5930,96 +6346,74 @@ class ExoplayerView :
 
                 val epOpen = episodeDrawer.isDrawerOpen(episodeDrawerContent)
                 val subOpen = binding.root.isDrawerOpen(subtitleDrawerContent)
-                val tracksOpen = trackRailController?.isOpen() == true
                 val commentOpen = episodeCommentPanel.visibility == View.VISIBLE
-                if (epOpen || subOpen || tracksOpen || commentOpen) {
+                val serverOpen = serverRailController?.isOpen() == true
+                if (epOpen || subOpen || commentOpen || serverOpen) {
+                    val rv: RecyclerView? = when {
+                        subOpen -> subtitleDrawerList
+                        epOpen -> episodeDrawerList
+                        commentOpen -> episodeCommentList
+                        serverOpen -> serverRailList
+                        else -> null
+                    }
+                    val fallback: View? = when {
+                        subOpen -> subtitleDrawerClose
+                        epOpen -> episodeDrawerClose
+                        commentOpen -> episodeCommentClose
+                        serverOpen -> serverDrawerClose
+                        else -> null
+                    }
                     val focused = currentFocus
-                    if (focused != null) {
-                        val insideRail = isDescendantOf(focused, episodeDrawerContent) ||
+                    val insideRail = focused != null && (
+                        isDescendantOf(focused, episodeDrawerContent) ||
                             isDescendantOf(focused, subtitleDrawerContent) ||
-                            isDescendantOf(focused, tracksDrawerContent) ||
-                            isDescendantOf(focused, episodeCommentPanel)
-                        if (!insideRail) {
-
+                            isDescendantOf(focused, episodeCommentPanel) ||
+                            isDescendantOf(focused, serverDrawerContent)
+                        )
+                    if (event.action == KeyEvent.ACTION_DOWN) {
+                        if (focused == null || !insideRail) {
                             Logger.log("Player rail focus escaped on ${if (event.keyCode == KeyEvent.KEYCODE_DPAD_UP) "UP" else "DOWN"}, refocusing")
-                            val target: View? = when {
-                                subOpen -> subtitleDrawerList.findViewHolderForAdapterPosition(0)?.itemView ?: subtitleDrawerClose
-                                epOpen -> {
-                                    val lm = episodeDrawerList.layoutManager as? LinearLayoutManager
-                                    val pos = lm?.findFirstVisibleItemPosition()?.coerceAtLeast(0) ?: 0
-                                    episodeDrawerList.findViewHolderForAdapterPosition(pos)?.itemView ?: episodeDrawerClose
-                                }
-                                commentOpen -> episodeCommentList.findViewHolderForAdapterPosition(0)?.itemView ?: episodeCommentClose
-                                tracksOpen -> tracksDrawerList.findViewHolderForAdapterPosition(0)?.itemView ?: tracksDrawerClose
-                                else -> null
-                            }
-                            target?.post { target.requestFocus() }
+                            if (rv != null && fallback != null) focusFirstVisibleFocusable(rv, fallback)
                             return true
                         }
-
-                        if (event.action == KeyEvent.ACTION_DOWN && event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
-                            val rv: RecyclerView? = when {
-                                subOpen && isDescendantOf(focused, subtitleDrawerContent) -> subtitleDrawerList
-                                epOpen && isDescendantOf(focused, episodeDrawerContent) -> episodeDrawerList
-                                commentOpen && isDescendantOf(focused, episodeCommentPanel) -> episodeCommentList
-                                tracksOpen && isDescendantOf(focused, tracksDrawerContent) -> tracksDrawerList
-                                else -> null
-                            }
-                            if (rv != null) {
-
-                                var item: View? = focused
-                                while (item != null && item.parent !== rv) {
-                                    item = item.parent as? View
-                                }
-                                val pos = item?.let { rv.getChildAdapterPosition(it) }
-                                    ?: RecyclerView.NO_POSITION
-                                if (pos != RecyclerView.NO_POSITION) {
-                                    val last = (rv.adapter?.itemCount ?: 0) - 1
-                                    if (pos == last) {
-
-                                        Logger.log("Player rail at bottom, DPAD_DOWN consumed to prevent wrap to top")
-                                        if (rv.canScrollVertically(1)) rv.smoothScrollBy(0, 80)
-                                        return true
-                                    }
-
-                                    val lm = rv.layoutManager as? LinearLayoutManager
-                                    val lastVisible = lm?.findLastVisibleItemPosition() ?: -1
-                                    if (pos >= lastVisible && rv.canScrollVertically(1)) {
-                                        rv.smoothScrollToPosition((pos + 1).coerceAtMost(last))
-                                    }
-                                }
-                            }
+                        if (rv != null && fallback != null && moveRailFocus(rv, fallback, event.keyCode)) {
+                            return true
                         }
-                    } else if (event.action == KeyEvent.ACTION_DOWN) {
-
-                        Logger.log("Player rail no focus on ${if (event.keyCode == KeyEvent.KEYCODE_DPAD_UP) "UP" else "DOWN"}, restoring")
-                        when {
-                            subOpen -> subtitleRailController?.focusFirst() ?: subtitleDrawerClose.requestFocus()
-                            epOpen -> {
-                                val lm = episodeDrawerList.layoutManager as? LinearLayoutManager
-                                val pos = lm?.findFirstVisibleItemPosition()?.coerceAtLeast(0) ?: 0
-                                episodeDrawerList.findViewHolderForAdapterPosition(pos)?.itemView?.requestFocus()
-                                    ?: episodeDrawerClose.requestFocus()
-                            }
-                            commentOpen -> episodeCommentClose.requestFocus()
-                            tracksOpen -> tracksDrawerClose.requestFocus()
-                        }
-                        return true
                     }
+                    return super.dispatchKeyEvent(event)
                 }
                 return false
             }
             KEYCODE_DPAD_LEFT, KEYCODE_DPAD_RIGHT -> {
+                val railFocused = currentFocus?.let { focused ->
+                    isDescendantOf(focused, episodeDrawerContent) ||
+                        isDescendantOf(focused, subtitleDrawerContent) ||
+                        isDescendantOf(focused, episodeCommentPanel) ||
+                        isDescendantOf(focused, serverDrawerContent)
+                } ?: false
+                if (isAnyRailOpen() && railFocused) return super.dispatchKeyEvent(event)
                 if (progressFocused) {
                     if (event.action == KeyEvent.ACTION_DOWN) {
                         ensureControllerVisible()
                         val forward = event.keyCode == KEYCODE_DPAD_RIGHT
                         val seekTime = PrefManager.getVal<Int>(PrefName.SeekTime)
-                        val currentPos = exoPlayer.currentPosition
-                        if (forward) {
-                            seekToMs(currentPos + seekTime * 1000)
+                        if (isSeekPreviewAvailable()) {
+                            playerView.controllerShowTimeoutMs = 0
+                            if (!seekPreviewMode) {
+                                beginSeekPreview(exoPlayer.currentPosition, fromTouch = false)
+                            }
+                            val delta = seekTime.coerceAtLeast(1) * 1000L
+                            updateSeekPreview(
+                                seekPreviewPositionMs + if (forward) delta else -delta,
+                                fromTouch = false,
+                            )
                         } else {
-                            seekToMs(currentPos - seekTime * 1000)
+                            val currentPos = exoPlayer.currentPosition
+                            if (forward) {
+                                seekToMs(currentPos + seekTime * 1000)
+                            } else {
+                                seekToMs(currentPos - seekTime * 1000)
+                            }
                         }
                     }
                     return true
@@ -6039,8 +6433,10 @@ class ExoplayerView :
             }
             KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
                 if (event.action == KeyEvent.ACTION_UP) {
-                    if (playerView.isControllerFullyVisible) {
-                        currentFocus?.performClick() ?: exoPlay.performClick()
+                    val railOpen = isAnyRailOpen()
+                    if (railOpen || playerView.isControllerFullyVisible) {
+                        val clicked = currentFocus?.performClick() == true
+                        if (!clicked && !railOpen) exoPlay.performClick()
                     } else ensureControllerVisible()
                 }
                 return true
@@ -6109,6 +6505,130 @@ class ExoplayerView :
         return false
     }
 
+    private fun isAnyRailOpen(): Boolean {
+        val subtitles = this::subtitleDrawerContent.isInitialized &&
+            this::binding.isInitialized &&
+            binding.root.isDrawerOpen(subtitleDrawerContent)
+        val episodes = this::episodeDrawer.isInitialized &&
+            this::episodeDrawerContent.isInitialized &&
+            episodeDrawer.isDrawerOpen(episodeDrawerContent)
+        val comments = this::episodeCommentPanel.isInitialized &&
+            episodeCommentPanel.visibility == View.VISIBLE
+        return subtitles || episodes || comments || serverRailController?.isOpen() == true
+    }
+
+    private fun isSubtitleHeaderFocused(): Boolean {
+        val focused = currentFocus ?: return false
+        val language = this::subtitleLangButton.isInitialized && focused === subtitleLangButton
+        val close = this::subtitleDrawerClose.isInitialized && focused === subtitleDrawerClose
+        return language || close
+    }
+
+    private fun isRailChipFocused(): Boolean {
+        val focused = currentFocus ?: return false
+        val season = this::railSeasonChips.isInitialized &&
+            (focused === railSeasonChips || isDescendantOf(focused, railSeasonChips))
+        val server = this::serverRailChips.isInitialized &&
+            (focused === serverRailChips || isDescendantOf(focused, serverRailChips))
+        return season || server
+    }
+
+    private fun isServerStripFocused(): Boolean {
+        val focused = currentFocus ?: return false
+        val refresh = this::serverRailRefreshAll.isInitialized &&
+            (focused === serverRailRefreshAll || isDescendantOf(focused, serverRailRefreshAll))
+        val makeDefault = this::serverRailMakeDefault.isInitialized &&
+            (focused === serverRailMakeDefault || isDescendantOf(focused, serverRailMakeDefault))
+        return refresh || makeDefault
+    }
+
+    private fun isServerTabsFocused(): Boolean {
+        val focused = currentFocus ?: return false
+        return this::serverRailTabs.isInitialized &&
+            (focused === serverRailTabs || isDescendantOf(focused, serverRailTabs))
+    }
+
+
+    private fun moveRailFocus(rv: RecyclerView, fallback: View, keyCode: Int): Boolean {
+        val focused = currentFocus ?: return false
+        if (focused === rv) {
+            if (keyCode == KeyEvent.KEYCODE_DPAD_UP) return false
+            focusFirstVisibleFocusable(rv, fallback)
+            return true
+        }
+        var item: View? = focused
+        while (item != null && item.parent !== rv) item = item.parent as? View
+        if (item == null) {
+            if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN && rv !== serverRailList) {
+                focusFirstVisibleFocusable(rv, fallback)
+                return true
+            }
+            return false
+        }
+        val pos = rv.getChildAdapterPosition(item)
+        if (pos == RecyclerView.NO_POSITION) return false
+
+        val step = if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN) 1 else -1
+        val count = rv.adapter?.itemCount ?: 0
+        if (count == 0) return false
+        val lm = rv.layoutManager as? LinearLayoutManager
+        val firstVisible = lm?.findFirstVisibleItemPosition() ?: 0
+        val lastVisible = lm?.findLastVisibleItemPosition() ?: (count - 1)
+        val range = if (step > 0) {
+            (pos + 1..lastVisible).filter { it in 0 until count }
+        } else {
+            (pos - 1 downTo firstVisible).filter { it in 0 until count }
+        }
+        for (i in range) {
+            val view = rv.findViewHolderForAdapterPosition(i)?.itemView ?: continue
+            if (focusFirstFocusableInRow(view)) return true
+        }
+
+        val next = pos + step
+        if (next !in 0 until count) {
+            if (step > 0) {
+                Logger.log("Player rail at bottom, DPAD_DOWN consumed to prevent wrap to top")
+                if (rv.canScrollVertically(1)) rv.smoothScrollBy(0, 80)
+                return true
+            }
+            return false
+        }
+        if (step < 0 && !rv.canScrollVertically(-1)) return false
+
+        rv.scrollToPosition(next)
+        rv.post {
+            var target = next
+            while (target in 0 until count) {
+                val view = rv.findViewHolderForAdapterPosition(target)?.itemView
+                if (view != null && focusFirstFocusableInRow(view)) {
+                    return@post
+                }
+                target += step
+            }
+        }
+        return true
+    }
+
+    private fun focusFirstVisibleFocusable(rv: RecyclerView, fallback: View) {
+        val lm = rv.layoutManager as? LinearLayoutManager
+        val first = lm?.findFirstVisibleItemPosition()?.coerceAtLeast(0) ?: 0
+        val last = lm?.findLastVisibleItemPosition() ?: first
+        for (i in first..last) {
+            val item = rv.findViewHolderForAdapterPosition(i)?.itemView ?: continue
+            if (focusFirstFocusableInRow(item)) return
+        }
+        fallback.requestFocus()
+    }
+
+    private fun focusFirstFocusableInRow(view: View): Boolean {
+        if (view.isShown && view.isFocusable && view.requestFocus()) return true
+        if (view !is ViewGroup) return false
+        for (i in 0 until view.childCount) {
+            if (focusFirstFocusableInRow(view.getChildAt(i))) return true
+        }
+        return false
+    }
+
     private fun startExoPlayer() {
         Logger.log(
             "Player: starting ep '${media.anime?.selectedEpisode}' server='${media.selected?.server}' " +
@@ -6117,6 +6637,243 @@ class ExoplayerView :
         exoPlayer.setMediaItem(mediaItem)
         exoPlayer.prepare()
         playerView.player = exoPlayer
+    }
+
+    private fun setupSeekPreview() {
+        seekPreviewEnabled = PrefManager.getVal<Boolean>(PrefName.SeekPreview)
+        seekPreviewPreload = PrefManager.getVal<Boolean>(PrefName.SeekPreviewPreload)
+        seekPreviewCard.visibility = View.GONE
+        if (!seekPreviewEnabled) return
+
+        val progressBar =
+            playerView.findViewById<DefaultTimeBar>(androidx.media3.ui.R.id.exo_progress)
+                ?: return
+        progressBar.addListener(
+            object : TimeBar.OnScrubListener {
+                override fun onScrubStart(timeBar: TimeBar, position: Long) {
+                    if (seekPreviewMode) return
+                    beginSeekPreview(position, fromTouch = true)
+                }
+
+                override fun onScrubMove(timeBar: TimeBar, position: Long) {
+                    if (!seekPreviewMode) return
+                    updateSeekPreview(position, fromTouch = true)
+                }
+
+                override fun onScrubStop(timeBar: TimeBar, position: Long, canceled: Boolean) {
+                    if (!seekPreviewMode) return
+                    endSeekPreview(apply = !canceled, fromTouch = true)
+                }
+            },
+        )
+    }
+
+    private fun isSeekPreviewAvailable(): Boolean =
+        seekPreviewEnabled && !isLiveStream() && video?.drm == null
+
+    private fun beginSeekPreview(position: Long, fromTouch: Boolean) {
+        if (!isSeekPreviewAvailable() || !isInitialized || playerReleased) return
+        if (seekPreviewMode) return
+
+        seekPreviewMode = true
+        seekPreviewPositionMs = clampSeekPreviewPosition(position)
+        seekPreviewResumePlayback = exoPlayer.playWhenReady
+        if (seekPreviewResumePlayback) exoPlayer.pause()
+
+        pauseMetadataTimer?.let { handler.removeCallbacks(it) }
+        pauseMetadataTimer = null
+        if (this::pauseOverlay.isInitialized) pauseOverlay.visibility = View.GONE
+
+        seekPreviewSavedTimeoutMs =
+            PrefManager.getVal<Int>(PrefName.AutoHideTimeout) * 1000
+        playerView.controllerShowTimeoutMs = 0
+        updateSeekPreview(seekPreviewPositionMs, fromTouch)
+        if (!fromTouch) startSeekPreviewTicker()
+    }
+
+    private fun updateSeekPreview(position: Long, fromTouch: Boolean) {
+        if (!seekPreviewMode) return
+
+        seekPreviewPositionMs = clampSeekPreviewPosition(position)
+        seekPreviewTime.text = formatSeekPreviewTime(seekPreviewPositionMs)
+        val wasHidden = seekPreviewCard.visibility != View.VISIBLE
+        seekPreviewCard.visibility = View.VISIBLE
+        positionSeekPreviewCard(seekPreviewPositionMs)
+        if (wasHidden) {
+            seekPreviewCard.post {
+                if (seekPreviewMode) positionSeekPreviewCard(seekPreviewPositionMs)
+            }
+        }
+
+        if (!fromTouch && this::exoPlayer.isInitialized && !exoPlayer.isReleased) {
+            playerView
+                .findViewById<DefaultTimeBar>(androidx.media3.ui.R.id.exo_progress)
+                ?.setPosition(seekPreviewPositionMs)
+        }
+
+        seekPreviewController?.request(seekPreviewPositionMs) { _, bitmap ->
+            if (!seekPreviewMode) return@request
+            seekPreviewImage.setImageBitmap(bitmap)
+        }
+    }
+
+    private fun endSeekPreview(apply: Boolean, fromTouch: Boolean) {
+        if (!seekPreviewMode) return
+
+        val target = seekPreviewPositionMs
+        val resume = seekPreviewResumePlayback
+        seekPreviewMode = false
+        seekPreviewResumePlayback = false
+        stopSeekPreviewTicker()
+        seekPreviewCard.visibility = View.GONE
+        playerView.controllerShowTimeoutMs = seekPreviewSavedTimeoutMs
+
+        if (!this::exoPlayer.isInitialized || exoPlayer.isReleased) return
+
+        if (apply) {
+            exoPlayer.seekTo(clampSeekPreviewPosition(target))
+        } else {
+            playerView
+                .findViewById<DefaultTimeBar>(androidx.media3.ui.R.id.exo_progress)
+                ?.setPosition(exoPlayer.currentPosition)
+        }
+        if (resume) {
+            exoPlayer.play()
+        } else {
+            schedulePauseOverlayTimer()
+        }
+    }
+
+    private fun cancelSeekPreviewUi() {
+        seekPreviewMode = false
+        seekPreviewResumePlayback = false
+        stopSeekPreviewTicker()
+        if (this::seekPreviewCard.isInitialized) seekPreviewCard.visibility = View.GONE
+        if (this::playerView.isInitialized) {
+            playerView.controllerShowTimeoutMs =
+                PrefManager.getVal<Int>(PrefName.AutoHideTimeout) * 1000
+        }
+    }
+
+    private fun startSeekPreviewTicker() {
+        if (seekPreviewTicker != null) return
+        val progressBar =
+            playerView.findViewById<DefaultTimeBar>(androidx.media3.ui.R.id.exo_progress)
+                ?: return
+        val ticker =
+            object : Runnable {
+                override fun run() {
+                    if (!seekPreviewMode) return
+                    progressBar.setPosition(seekPreviewPositionMs)
+                    progressBar.postOnAnimation(this)
+                }
+            }
+        seekPreviewTicker = ticker
+        progressBar.postOnAnimation(ticker)
+    }
+
+    private fun stopSeekPreviewTicker() {
+        val ticker = seekPreviewTicker ?: return
+        seekPreviewTicker = null
+        playerView
+            .findViewById<DefaultTimeBar>(androidx.media3.ui.R.id.exo_progress)
+            ?.removeCallbacks(ticker)
+    }
+
+    private fun positionSeekPreviewCard(position: Long) {
+        if (seekPreviewIsTv) {
+            seekPreviewCard.translationX = 0f
+            return
+        }
+
+        val progressBar =
+            playerView.findViewById<DefaultTimeBar>(androidx.media3.ui.R.id.exo_progress)
+                ?: return
+        val parent = seekPreviewCard.parent as? View ?: return
+        if (progressBar.width <= 0 || parent.width <= 0) {
+            seekPreviewCard.post {
+                if (seekPreviewMode) positionSeekPreviewCard(seekPreviewPositionMs)
+            }
+            return
+        }
+
+        val duration =
+            if (this::exoPlayer.isInitialized && exoPlayer.duration > 0L) exoPlayer.duration else 0L
+        if (duration <= 0L) return
+
+        val ratio = (position.toFloat() / duration).coerceIn(0f, 1f)
+        val barLocation = IntArray(2)
+        progressBar.getLocationOnScreen(barLocation)
+        val parentLocation = IntArray(2)
+        parent.getLocationOnScreen(parentLocation)
+
+        val density = resources.displayMetrics.density
+        val cardWidth =
+            if (seekPreviewCard.width > 0) {
+                seekPreviewCard.width
+            } else {
+                (160 * density).toInt()
+            }
+        val margin = 8 * density
+        val thumbX = (barLocation[0] - parentLocation[0]) + progressBar.width * ratio
+        val maxLeft = (parent.width - cardWidth - margin).coerceAtLeast(margin)
+        val desiredLeft = (thumbX - cardWidth / 2f).coerceIn(margin, maxLeft)
+        val baseLeft =
+            if (seekPreviewCard.left > 0) {
+                seekPreviewCard.left.toFloat()
+            } else {
+                (parent.width - cardWidth) / 2f
+            }
+        seekPreviewCard.translationX = desiredLeft - baseLeft
+    }
+
+    private fun clampSeekPreviewPosition(position: Long): Long {
+        if (!this::exoPlayer.isInitialized || exoPlayer.isReleased) return position.coerceAtLeast(0L)
+        val duration = exoPlayer.duration
+        return if (duration > 0L) position.coerceIn(0L, duration) else position.coerceAtLeast(0L)
+    }
+
+    private fun formatSeekPreviewTime(positionMs: Long): String {
+        val totalSeconds = (positionMs / 1000).coerceAtLeast(0L)
+        val hours = totalSeconds / 3600
+        val minutes = (totalSeconds % 3600) / 60
+        val seconds = totalSeconds % 60
+        return if (hours > 0) {
+            String.format(Locale.US, "%d:%02d:%02d", hours, minutes, seconds)
+        } else {
+            String.format(Locale.US, "%d:%02d", minutes, seconds)
+        }
+    }
+
+    private fun setupSeekPreviewForSource() {
+        if (!seekPreviewEnabled || !this::exoPlayer.isInitialized) return
+
+        val item = previewMediaItem
+        val sourceFactory = previewSourceFactory
+        if (item == null || sourceFactory == null || video?.drm != null ||
+            isLiveStream() || isDeclaredLiveStream()
+        ) {
+            seekPreviewController?.configure(
+                enabled = false,
+                preload = false,
+                mediaItem = null,
+                mediaSourceFactory = null,
+                durationMs = 0L,
+                allowPreload = false,
+            )
+            return
+        }
+
+        val format = video?.format
+        val allowPreload = format != VideoType.M3U8 && format != VideoType.DASH
+        seekPreviewController?.configure(
+            enabled = true,
+            preload = seekPreviewPreload,
+            mediaItem = item,
+            mediaSourceFactory = sourceFactory,
+            durationMs = exoPlayer.duration,
+            allowPreload = allowPreload,
+        )
     }
 
     private fun seekToMs(positionMs: Long) {

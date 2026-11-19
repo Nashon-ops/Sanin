@@ -71,6 +71,17 @@
 -keepclassmembers,allowoptimization class androidx.core.content.res.ColorStateListInflaterCompat { *; }
 -dontwarn androidx.core.content.res.ResourcesCompat
 
+
+
+
+-keep class androidx.core.view.ViewCompat { *; }
+-keep class androidx.core.view.WindowInsetsCompat { *; }
+-keep class androidx.core.view.WindowInsetsCompat$* { *; }
+-keep class androidx.core.view.OnApplyWindowInsetsListener { *; }
+-keep class androidx.core.view.WindowInsetsAnimationCompat { *; }
+-keep class androidx.core.view.WindowInsetsAnimationCompat$* { *; }
+-dontwarn androidx.core.view.**
+
 -keep class androidx.activity.** { *; }
 -dontwarn androidx.activity.**
 -keep class androidx.appcompat.** { *; }
@@ -84,6 +95,17 @@
 -keep class com.google.android.material.bottomsheet.** { *; }
 -keep class com.google.android.material.dialog.** { *; }
 -dontwarn com.google.android.material.**
+
+
+
+
+-keep class androidx.compose.** { *; }
+-dontwarn androidx.compose.**
+
+
+
+-keep class **.R { *; }
+-keep class **.R$* { *; }
 
 -keep class androidx.preference.** { *; }
 

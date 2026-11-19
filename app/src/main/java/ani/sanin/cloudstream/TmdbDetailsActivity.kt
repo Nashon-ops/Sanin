@@ -32,6 +32,8 @@ import ani.sanin.isDarkTheme
 import ani.sanin.connections.tmdb.Tmdb
 import ani.sanin.connections.tmdb.TmdbCast
 import ani.sanin.connections.tmdb.TmdbDetail
+import ani.sanin.connections.tmdb.TmdbExternalIds
+import ani.sanin.connections.tmdb.TmdbGenre
 import ani.sanin.connections.tmdb.TmdbMedia
 import ani.sanin.cloudstream.TmdbCards
 import ani.sanin.connections.simkl.Simkl
@@ -56,6 +58,9 @@ import ani.sanin.util.GlassEffectManager
 import ani.sanin.util.GlassComponent
 import ani.sanin.settings.saving.PrefManager
 import ani.sanin.settings.saving.PrefName
+import ani.sanin.settings.StremioAddonClient
+import ani.sanin.settings.StremioAddonManager
+import ani.sanin.settings.StremioMetaDetails
 import ani.sanin.ui.components.EchoNavPillController
 import com.google.android.material.card.MaterialCardView
 import com.lagradost.cloudstream3.CommonActivity
@@ -71,6 +76,10 @@ class TmdbDetailsActivity : AppCompatActivity(), TmdbWatchFragment.Host {
         const val ARG_PLUGIN_SOURCE = "pluginSource"
         const val ARG_PLUGIN_URL = "pluginUrl"
         const val ARG_OPEN_TAB = "openTab"
+        const val ARG_IMDB_ID = "imdbId"
+        const val ARG_SOURCE_ADDON = "sourceAddon"
+        const val ARG_TITLE = "title"
+        const val ARG_FROM_CONTINUE = "fromContinue"
         private const val TAG_WATCH = "tmdbWatch"
 
         const val TAB_INFO = 0
@@ -84,6 +93,9 @@ class TmdbDetailsActivity : AppCompatActivity(), TmdbWatchFragment.Host {
     private var mediaId: Int = -1
     private var pluginSourceId: String? = null
     private var pluginUrl: String? = null
+    private var imdbId: String? = null
+    private var sourceAddonUrl: String? = null
+    private var argTitle: String? = null
     private val pluginMode get() = pluginUrl != null
     private var detail: TmdbDetail? = null
     private var selectedPill = TAB_INFO
@@ -107,10 +119,16 @@ class TmdbDetailsActivity : AppCompatActivity(), TmdbWatchFragment.Host {
         mediaId = id
         pluginSourceId = null
         pluginUrl = null
+        imdbId = null
+        sourceAddonUrl = null
+        argTitle = null
         intent.putExtra(ARG_MEDIA_TYPE, type)
         intent.putExtra(ARG_MEDIA_ID, id)
         intent.removeExtra(ARG_PLUGIN_SOURCE)
         intent.removeExtra(ARG_PLUGIN_URL)
+        intent.removeExtra(ARG_IMDB_ID)
+        intent.removeExtra(ARG_SOURCE_ADDON)
+        intent.removeExtra(ARG_TITLE)
         recreate()
     }
 
@@ -121,12 +139,20 @@ class TmdbDetailsActivity : AppCompatActivity(), TmdbWatchFragment.Host {
             if (existing != null) {
                 fm.beginTransaction().remove(existing).commitNow()
             }
+            val fromContinue = intent.getBooleanExtra(ARG_FROM_CONTINUE, false)
+            intent.removeExtra(ARG_FROM_CONTINUE)
+            val autoContinue = fromContinue &&
+                PrefManager.getVal<Boolean>(PrefName.ContinueMedia)
             fm.beginTransaction()
                 .add(R.id.tmdbDetailFragmentContainer, TmdbWatchFragment.newInstance(
                     mediaType = mediaType,
                     mediaId = mediaId,
                     pluginSourceId = pluginSourceId,
-                    pluginUrl = pluginUrl
+                    pluginUrl = pluginUrl,
+                    imdbId = imdbId,
+                    sourceAddonUrl = sourceAddonUrl,
+                    title = argTitle,
+                    autoContinue = autoContinue,
                 ), TAG_WATCH)
                 .commit()
         } else {
@@ -154,7 +180,11 @@ class TmdbDetailsActivity : AppCompatActivity(), TmdbWatchFragment.Host {
         mediaId = intent.getIntExtra(ARG_MEDIA_ID, -1)
         pluginSourceId = intent.getStringExtra(ARG_PLUGIN_SOURCE)
         pluginUrl = intent.getStringExtra(ARG_PLUGIN_URL)
-        Logger.log("TMDB_DETAILS: opened mediaType=$mediaType mediaId=$mediaId")
+        imdbId = intent.getStringExtra(ARG_IMDB_ID)?.takeIf { it.isNotBlank() }
+        sourceAddonUrl = intent.getStringExtra(ARG_SOURCE_ADDON)?.takeIf { it.isNotBlank() }
+        argTitle = intent.getStringExtra(ARG_TITLE)?.takeIf { it.isNotBlank() }
+        if (imdbId != null && mediaId == -1) mediaId = ImdbMedia.syntheticMediaId(imdbId!!)
+        Logger.log("TMDB_DETAILS: opened mediaType=$mediaType mediaId=$mediaId imdb=$imdbId")
 
         shell.tmdbDetailBack.setOnClickListener { finish() }
         FocusEffectUtil.applyFocusListener(shell.tmdbDetailBack)
@@ -299,6 +329,57 @@ class TmdbDetailsActivity : AppCompatActivity(), TmdbWatchFragment.Host {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
+    private suspend fun withStremioFallback(base: TmdbDetail?): TmdbDetail? {
+        if (base != null && !base.overview.isNullOrBlank() && base.posterPath != null) return base
+        val sourceId = PrefManager.getVal<String>(PrefName.ContentSource)
+        val candidates = buildList {
+            StremioAddonManager.addonForSourceId(sourceId)?.let { add(it) }
+            addAll(StremioAddonManager.metadataSources())
+        }.distinctBy { it.transportUrl }
+        val imdb = base?.externalIds?.imdbId
+        var meta: StremioMetaDetails? = null
+        for (addon in candidates) {
+            if (!StremioAddonClient.supports(addon, "meta", mediaType)) continue
+            meta = runCatching {
+                StremioAddonClient.loadMeta(addon, mediaType, mediaId, imdb)
+            }.getOrNull()
+            if (meta != null) break
+        }
+        val found = meta ?: return base
+        val fallbackGenres = found.genres.mapIndexed { i, name -> TmdbGenre(i + 1, name) }
+        if (base == null) {
+            return TmdbDetail(
+                id = mediaId,
+                title = if (mediaType == "movie") found.name else null,
+                name = if (mediaType == "movie") null else found.name,
+                overview = found.description,
+                posterPath = found.poster,
+                backdropPath = found.background,
+                voteAverage = found.imdbRating?.toDoubleOrNull() ?: 0.0,
+                releaseDate = if (mediaType == "movie") found.releaseInfo else null,
+                firstAirDate = if (mediaType == "movie") null else found.releaseInfo,
+                genres = fallbackGenres,
+            )
+        }
+        return base.copy(
+            overview = base.overview?.takeIf { it.isNotBlank() } ?: found.description,
+            posterPath = base.posterPath ?: found.poster,
+            backdropPath = base.backdropPath ?: found.background,
+            genres = if (base.genres.isEmpty()) fallbackGenres else base.genres,
+        )
+    }
+
+    private fun emptyImdbDetail(): TmdbDetail {
+        Logger.log("TMDB_DETAILS: meta exhausted for imdb=$imdbId addon=$sourceAddonUrl, showing empty details")
+        snackString("No details found — try the Watch tab")
+        return TmdbDetail(
+            id = mediaId,
+            title = if (mediaType == "movie") argTitle else null,
+            name = if (mediaType == "tv") argTitle else null,
+            externalIds = TmdbExternalIds(imdbId = imdbId),
+        )
+    }
+
     private fun load() {
         if (pluginMode) {
             loadPlugin()
@@ -307,7 +388,11 @@ class TmdbDetailsActivity : AppCompatActivity(), TmdbWatchFragment.Host {
         lifecycleScope.launch {
             binding.mediaInfoProgressBar.visibility = View.VISIBLE
             binding.mediaInfoContainer.visibility = View.GONE
-            val d = Tmdb.detail(mediaType, mediaId) ?: run {
+            val d = if (imdbId != null) {
+                ImdbMedia.loadDetail(mediaType, imdbId!!, sourceAddonUrl) ?: emptyImdbDetail()
+            } else {
+                withStremioFallback(Tmdb.detail(mediaType, mediaId))
+            } ?: run {
                 binding.mediaInfoProgressBar.visibility = View.GONE
                 snackString("Could not load details"); return@launch
             }

@@ -47,12 +47,19 @@ import ani.sanin.getThemeColor
 import ani.sanin.loadImage
 import ani.sanin.settings.saving.PrefManager
 import ani.sanin.settings.saving.PrefName
+import ani.sanin.settings.StremioAddon
+import ani.sanin.settings.StremioAddonClient
+import ani.sanin.settings.StremioAddonManager
+import ani.sanin.settings.StremioCatalogCard
 import ani.sanin.settings.SettingsAccountActivity
 import ani.sanin.sizeBannerCard
 import ani.sanin.px
+import ani.sanin.ui.LensButtonBackground
 import ani.sanin.util.FocusEffectUtil
+import ani.sanin.util.Logger
+import com.lagradost.cloudstream3.HomePageResponse
+import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageRequest
-import com.lagradost.cloudstream3.LiveSearchResponse
 import com.lagradost.cloudstream3.SearchResponse
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -113,6 +120,16 @@ class TmdbHomeFragment : Fragment() {
     private var bannerCarouselAdapter: TmdbBannerCarouselAdapter? = null
     private val bannerSnapHelper = PagerSnapHelper()
     private var loggedOutCtaButton: View? = null
+    private var sectionProviderLabel: String? = null
+    private var sectionConfig: List<HomeSectionEntry> = emptyList()
+    private var appliedConfigVersion = -1
+    private var currentProviderId: String? = null
+    private data class RenderedSection(
+        val providerId: String?,
+        val sectionKey: String?,
+        val views: List<View>,
+    )
+    private val renderedSections = mutableListOf<RenderedSection>()
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -128,7 +145,7 @@ class TmdbHomeFragment : Fragment() {
         binding.tmdbBannerFrame.setOnClickListener {
             val item = bannerItems.getOrNull(bannerIndex) ?: return@setOnClickListener
             when (item) {
-                is BannerItem.Tmdb -> openDetails(item.media.type, item.media.id)
+                is BannerItem.Tmdb -> openMedia(item.media)
                 is BannerItem.Plugin -> {
                     if (item.tmdbId != null && item.tmdbType != null) {
                         openDetails(item.tmdbType, item.tmdbId)
@@ -257,7 +274,13 @@ class TmdbHomeFragment : Fragment() {
                     else -> false
                 }
             }
-            FocusEffectUtil.applyFocusListener(btn)
+            val watchRadiusPx = 12f * btn.resources.displayMetrics.density
+            LensButtonBackground.apply(
+                btn,
+                tint = LensButtonBackground.WATCH_TINT,
+                cornerRadiusPx = watchRadiusPx,
+            )
+            FocusEffectUtil.applyFocusListener(btn, cornerRadiusPx = watchRadiusPx)
         }
     }
 
@@ -298,8 +321,11 @@ class TmdbHomeFragment : Fragment() {
     override fun onResume() {
         super.onResume()
         startAutoAdvance()
+        if (PrefManager.getVal<Int>(PrefName.HomeSectionsMovieTvVersion) != appliedConfigVersion) {
+            load()
+        }
 
-        val live = Refresh.activity.getOrPut(requireActivity().hashCode()) { androidx.lifecycle.MutableLiveData(true) }
+        val live = Refresh.activity.getOrPut(requireActivity().hashCode()) { androidx.lifecycle.MutableLiveData(false) }
         live.observe(viewLifecycleOwner) { if (it == true) { load(); live.postValue(false) } }
     }
 
@@ -315,43 +341,402 @@ class TmdbHomeFragment : Fragment() {
         bannerCarouselAdapter = null
         loggedOutCtaButton = null
         logoJob?.cancel()
+        loadJob?.cancel()
         _binding = null
     }
 
     private fun load() {
+        if (!isAdded || _binding == null) return
+        appliedConfigVersion = PrefManager.getVal<Int>(PrefName.HomeSectionsMovieTvVersion)
         val sourceId = PrefManager.getVal<String>(PrefName.ContentSource)
+        val allSources = sourceId == CsRuntime.ALL_SOURCES_ID
+        val stremioAddon = StremioAddonManager.addonForSourceId(sourceId)
+        val pluginId = CsRuntime.pluginIdOf(sourceId)
+        val apiIndex = CsRuntime.apiIndexOf(sourceId)
         val plugin = if (sourceId == "simkl" || sourceId == "tmdb") null
-            else CsRepos.installed(requireContext()).firstOrNull { it.id == sourceId }
+            else CsRepos.installed(requireContext()).firstOrNull { it.id == pluginId }
+        sectionConfig = HomeSectionsConfig.loadMovieTv()
+        renderedSections.clear()
+        currentProviderId = null
         loadJob?.cancel()
         binding.tmdbHomeSections.removeAllViews()
         loggedOutCtaButton = null
+        sectionProviderLabel = null
         binding.tmdbHomeSpinner.isVisible = true
         loadJob = viewLifecycleOwner.lifecycleScope.launch {
+            if (_binding == null) return@launch
 
-            loadBanner(plugin)
+            if (allSources) {
+                loadAllSources()
+                if (_binding != null) binding.tmdbHomeSpinner.isVisible = false
+                return@launch
+            }
 
-            val hasPluginSections = if (plugin != null) {
-                loadPluginSections(plugin)
-            } else false
+            if (stremioAddon != null) {
+                currentProviderId = "stremio:${stremioAddon.transportUrl}"
+                loadStremioHome(stremioAddon)
+                if (_binding == null) return@launch
+                applySectionConfig()
+                currentProviderId = null
+                if (_binding != null && binding.tmdbHomeSections.childCount == 0) {
+                    addEmptyState("No sections available for ${stremioAddon.manifest.name}")
+                }
+                if (_binding != null) binding.tmdbHomeSpinner.isVisible = false
+                return@launch
+            }
 
-            val loggedOut = plugin == null && isSimklLoggedOut()
-            if (loggedOut) {
-                addLoggedOutCta()
-                loadPublicSections()
+            val mainPageCache = mutableMapOf<String, HomePageResponse?>()
+            loadBanner(plugin, apiIndex, mainPageCache)
+
+            if (plugin != null) {
+                currentProviderId = "cs:${plugin.id}"
+                loadPluginSections(plugin, apiIndex, mainPageCache)
+                if (_binding == null) return@launch
+                applySectionConfig()
+                currentProviderId = null
+                if (_binding != null && binding.tmdbHomeSections.childCount == 0) {
+                    addEmptyState("No sections available for ${plugin.name}")
+                }
             } else {
-                loadSimklContinueWatching()
-                if (!hasPluginSections) {
+                val loggedOut = isSimklLoggedOut()
+                if (loggedOut) {
+                    addLoggedOutCta()
+                    loadPublicSections()
+                } else {
+                    currentProviderId = "simkl"
+                    loadSimklContinueWatching()
                     loadSimklHomeSections()
+                    if (_binding == null) return@launch
+                    applySectionConfig()
+                    currentProviderId = null
                 }
             }
-            binding.tmdbHomeSpinner.isVisible = false
+            if (_binding != null) binding.tmdbHomeSpinner.isVisible = false
         }
+    }
+
+    private suspend fun loadAllSources() {
+        val ctx = context ?: return
+        val mainPageCache = mutableMapOf<String, HomePageResponse?>()
+        loadBanner(null)
+
+        val plugins = withContext(Dispatchers.IO) {
+            runCatching { CsRepos.installed(ctx) }.getOrDefault(emptyList())
+        }
+        val addons = withContext(Dispatchers.IO) {
+            runCatching { StremioAddonManager.homeSources() }.getOrDefault(emptyList())
+        }
+        if (_binding == null) return
+        var rendered = 0
+
+        if (!isSimklLoggedOut()) {
+            rendered += loadProviderGroup("simkl", "Simkl") {
+                loadSimklContinueWatching()
+                loadSimklHomeSections()
+            }
+        }
+        for (plugin in plugins) {
+            if (_binding == null) return
+            rendered += loadProviderGroup("cs:${plugin.id}", plugin.name) {
+                loadPluginSections(plugin, null, mainPageCache)
+            }
+        }
+        for (addon in addons) {
+            if (_binding == null) return
+            rendered += loadProviderGroup("stremio:${addon.transportUrl}", addon.manifest.name) {
+                loadStremioHome(addon, updateBanner = false)
+            }
+        }
+        applySectionConfig()
+        if (rendered == 0 || binding.tmdbHomeSections.childCount == 0) {
+            addEmptyState("No catalogs available")
+        }
+        applyTmdbBannerFocusChain()
+    }
+
+    private suspend fun loadProviderGroup(
+        providerId: String,
+        name: String,
+        block: suspend () -> Unit,
+    ): Int {
+        if (!isAdded || _binding == null) return 0
+        val start = binding.tmdbHomeSections.childCount
+        sectionProviderLabel = name
+        currentProviderId = providerId
+        try {
+            block()
+        } finally {
+            sectionProviderLabel = null
+            currentProviderId = null
+        }
+        if (!isAdded || _binding == null) return 0
+        return binding.tmdbHomeSections.childCount - start
+    }
+
+    private fun sectionHeader(ctx: android.content.Context, title: String): View {
+        val titleColor = ctx.getThemeColor(com.google.android.material.R.attr.colorOnSurface)
+        val titleView = TextView(ctx).apply {
+            text = title
+            textSize = 16f
+            setTypeface(android.graphics.Typeface.DEFAULT_BOLD)
+            setTextColor(titleColor)
+        }
+        val provider = sectionProviderLabel
+        if (provider.isNullOrBlank()) {
+            titleView.setPadding(24, 14, 24, 8)
+            return titleView
+        }
+        val primary = ctx.getThemeColor(com.google.android.material.R.attr.colorPrimary)
+        val chip = TextView(ctx).apply {
+            text = provider
+            textSize = 11f
+            setTextColor(primary)
+            setPadding(8f.px, 2f.px, 8f.px, 2f.px)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = 999f
+                setColor(androidx.core.graphics.ColorUtils.setAlphaComponent(primary, 0x33))
+            }
+        }
+        return LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(24, 14, 8, 8)
+            addView(
+                titleView,
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            )
+            addView(
+                chip,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = 8f.px }
+            )
+        }
+    }
+
+    private fun registerSection(sectionKey: String?, views: List<View>) {
+        if (_binding == null) return
+        renderedSections.add(RenderedSection(currentProviderId, sectionKey, views))
+    }
+
+    private fun applySectionConfig() {
+        val b = _binding ?: return
+        if (renderedSections.isEmpty()) return
+        val byKey = HashMap<String, RenderedSection>()
+        renderedSections.forEach { section ->
+            val pid = section.providerId ?: return@forEach
+            val key = section.sectionKey ?: return@forEach
+            byKey["$pid|$key"] = section
+        }
+        val ordered = mutableListOf<RenderedSection>()
+        val handled = HashSet<String>()
+        sectionConfig.forEach { entry ->
+            val key = "${entry.providerId}|${entry.sectionKey}"
+            val section = byKey[key] ?: return@forEach
+            handled.add(key)
+            if (entry.enabled) ordered.add(section)
+        }
+        renderedSections.forEach { section ->
+            val key = section.providerId?.let { pid ->
+                section.sectionKey?.let { sk -> "$pid|$sk" }
+            }
+            if (key == null || key !in handled) ordered.add(section)
+        }
+        b.tmdbHomeSections.removeAllViews()
+        ordered.forEach { section ->
+            section.views.forEach { b.tmdbHomeSections.addView(it) }
+        }
+        renderedSections.clear()
+        applyTmdbBannerFocusChain()
+    }
+
+    private fun openMedia(media: TmdbMedia) {
+        val type = if (media.type == "tv") "tv" else "movie"
+        if (media.id > 0) {
+            openDetails(media.type, media.id)
+            return
+        }
+        if (!media.imdbId.isNullOrBlank()) {
+            Logger.log("TMDB_HOME: no tmdb id for '${media.displayTitle}', opening addon meta id=${media.imdbId} addon=${media.sourceAddonUrl}")
+            startActivity(
+                Intent(requireContext(), TmdbDetailsActivity::class.java)
+                    .putExtra(TmdbDetailsActivity.ARG_MEDIA_TYPE, type)
+                    .putExtra(TmdbDetailsActivity.ARG_IMDB_ID, media.imdbId)
+                    .putExtra(TmdbDetailsActivity.ARG_TITLE, media.displayTitle)
+                    .apply { media.sourceAddonUrl?.let { putExtra(TmdbDetailsActivity.ARG_SOURCE_ADDON, it) } }
+            )
+            return
+        }
+        val title = media.displayTitle
+        if (title.isBlank()) return
+        viewLifecycleOwner.lifecycleScope.launch {
+            val results = withContext(Dispatchers.IO) {
+                runCatching { Tmdb.search(title) }.getOrDefault(emptyList())
+            }
+            val match = results.firstOrNull { it.type == media.type } ?: results.firstOrNull()
+            if (match != null) {
+                Logger.log("TMDB_HOME: resolved '${media.displayTitle}' to tmdb=${match.id} (${match.type})")
+                openDetails(match.type, match.id)
+            } else {
+                Logger.log("TMDB_HOME: no TMDB match for '${media.displayTitle}'")
+                android.widget.Toast.makeText(
+                    requireContext(),
+                    "No TMDB match for $title",
+                    android.widget.Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
+    private suspend fun loadStremioHome(addon: StremioAddon, updateBanner: Boolean = true): Boolean {
+        Logger.log(
+            "TMDB_HOME: stremio addon='${addon.manifest.name}' types=${addon.manifest.types} " +
+                "capabilities=${StremioAddonClient.capabilities(addon)} " +
+                "resources=${addon.manifest.resources.size} catalogs=${addon.manifest.catalogs.size}"
+        )
+        val shelves = withContext(Dispatchers.IO) {
+            runCatching { StremioAddonClient.loadHomeCatalogShelves(addon) }
+                .onFailure { Logger.log("TMDB_HOME: stremio catalog load failed: ${it.message}") }
+                .getOrDefault(emptyList())
+        }
+        if (shelves.isEmpty()) {
+            Logger.log("TMDB_HOME: no catalog shelves for ${addon.manifest.name}")
+            return false
+        }
+        Logger.log(
+            "TMDB_HOME: shelves for ${addon.manifest.name}: " +
+                shelves.joinToString(" | ") { "${it.name}=${it.cards.size}" }
+        )
+        val distinctCards = LinkedHashMap<String, StremioCatalogCard>()
+        shelves.forEach { shelf ->
+            shelf.cards.take(3).forEach { card ->
+                val key = "${card.type}:${card.id}"
+                if (!distinctCards.containsKey(key)) distinctCards[key] = card
+            }
+        }
+        val mapping = distinctCards.entries.toList().limitedAsyncMap(6) { (key, card) ->
+            key to mapStremioCardToTmdb(card)
+        }.toMap()
+        val resolvedShelves = shelves.mapNotNull { shelf ->
+            val items = shelf.cards.take(20)
+                .mapNotNull { card ->
+                    enrichCard(card, mapping["${card.type}:${card.id}"], cardHint(card.type), addon.transportUrl)
+                }
+                .distinctBy { "${it.type}:${it.id}:${it.displayTitle}" }
+            if (items.isEmpty()) null else shelf.name to items
+        }
+        if (resolvedShelves.isEmpty()) {
+            Logger.log("TMDB_HOME: no cards for ${addon.manifest.name}")
+            return false
+        }
+        val allItems = resolvedShelves.flatMap { it.second }
+        val bannerCandidates = allItems.filter { it.id > 0 }
+        if (updateBanner) {
+            bannerItems.clear()
+            bannerItems.addAll(bannerCandidates.take(10).map { BannerItem.Tmdb(it) })
+        }
+        resolvedShelves.forEach { (name, items) ->
+            addSection(name, items, onClick = ::openMedia, showMore = false)
+        }
+        Logger.log(
+            "TMDB_HOME: stremio '${addon.manifest.name}' shelves=${resolvedShelves.size} " +
+                "cards=${allItems.size} mapped=${mapping.values.count { it != null }}"
+        )
+        if (updateBanner && bannerItems.isNotEmpty()) {
+            bannerIndex = 0
+            showBanner(0)
+        }
+        applyTmdbBannerFocusChain()
+        return true
+    }
+
+    private fun cardHint(type: String): String =
+        if (type.equals("series", true) || type.equals("tv", true) || type.equals("anime", true)) "tv"
+        else "movie"
+
+    private suspend fun loadExtraAddonSections() {
+        val addons = withContext(Dispatchers.IO) { StremioAddonManager.homeSources() }
+        if (addons.isEmpty()) return
+        Logger.log("TMDB_HOME: extra addon sources ${addons.map { it.manifest.name }}")
+        val usedTitles = HashSet<String>()
+        for (addon in addons) {
+            val shelves = withContext(Dispatchers.IO) {
+                runCatching { StremioAddonClient.loadHomeCatalogShelves(addon) }
+                    .onFailure { Logger.log("TMDB_HOME: extra shelves failed for ${addon.manifest.name}: ${it.message}") }
+                    .getOrDefault(emptyList())
+            }
+            val distinctCards = LinkedHashMap<String, StremioCatalogCard>()
+            shelves.forEach { shelf ->
+                shelf.cards.take(20).forEach { card ->
+                    val key = "${card.type}:${card.id}"
+                    if (!distinctCards.containsKey(key)) distinctCards[key] = card
+                }
+            }
+            val mapping = distinctCards.entries.toList().limitedAsyncMap(6) { (key, card) ->
+                key to mapStremioCardToTmdb(card)
+            }.toMap()
+            shelves.forEach { shelf ->
+                val items = shelf.cards.take(20)
+                    .mapNotNull { enrichCard(it, mapping["${it.type}:${it.id}"], cardHint(it.type), addon.transportUrl) }
+                    .distinctBy { "${it.type}:${it.id}:${it.displayTitle}" }
+                if (items.isEmpty()) return@forEach
+                var title = shelf.name
+                if (!usedTitles.add(title)) title = "$title — ${addon.manifest.name}"
+                Logger.log(
+                    "TMDB_HOME: extra shelf addon='${addon.manifest.name}' title='$title' cards=${items.size}"
+                )
+                addSection(title, items, onClick = ::openMedia, showMore = false)
+            }
+        }
+    }
+
+    private fun enrichCard(card: StremioCatalogCard, mapped: TmdbMedia?, hint: String, addonUrl: String): TmdbMedia? {
+        if (mapped != null) {
+            return mapped.copy(
+                posterPath = mapped.posterPath ?: card.poster,
+                backdropPath = mapped.backdropPath ?: card.background,
+                overview = mapped.overview?.takeIf { it.isNotBlank() } ?: card.description,
+                voteAverage = if (mapped.voteAverage > 0) mapped.voteAverage
+                else card.imdbRating?.toDoubleOrNull() ?: 0.0,
+                mediaType = mapped.mediaType ?: hint,
+            )
+        }
+        val title = card.name.takeIf { it.isNotBlank() } ?: return null
+        return TmdbMedia(
+            id = 0,
+            title = if (hint == "movie") title else null,
+            name = if (hint == "movie") null else title,
+            posterPath = card.poster,
+            backdropPath = card.background,
+            voteAverage = card.imdbRating?.toDoubleOrNull() ?: 0.0,
+            releaseDate = if (hint == "movie") card.releaseInfo else null,
+            firstAirDate = if (hint == "movie") null else card.releaseInfo,
+            overview = card.description,
+            mediaType = hint,
+            imdbId = card.id,
+            sourceAddonUrl = addonUrl,
+        )
+    }
+
+    private suspend fun mapStremioCardToTmdb(card: StremioCatalogCard): TmdbMedia? {
+        val hint = cardHint(card.type)
+        if (card.id.startsWith("tt")) {
+            runCatching { Tmdb.findByImdb(card.id, hint) }.getOrNull()?.let { return it }
+        }
+        val title = card.name.takeIf { it.isNotBlank() } ?: return null
+        val year = card.releaseInfo?.take(4)?.toIntOrNull()
+        val results = runCatching { Tmdb.search(title) }.getOrDefault(emptyList())
+        return results.firstOrNull { it.type == hint && (year == null || it.year == year.toString()) }
+            ?: results.firstOrNull { it.type == hint }
+            ?: results.firstOrNull()
     }
 
     private fun isSimklLoggedOut(): Boolean =
         PrefManager.getNullableVal<Simkl.SimklToken>(PrefName.SimklToken, null) == null
 
     private fun addLoggedOutCta() {
+        if (_binding == null || !isAdded) return
         val cta = layoutInflater.inflate(R.layout.view_logged_out_cta, binding.tmdbHomeSections, false)
         val button = cta.findViewById<View>(R.id.loggedOutLinkButton)
         button.setOnClickListener {
@@ -380,7 +765,11 @@ class TmdbHomeFragment : Fragment() {
         applyTmdbBannerFocusChain()
     }
 
-    private suspend fun loadBanner(plugin: CsInstalledSource? = null) {
+    private suspend fun loadBanner(
+        plugin: CsInstalledSource? = null,
+        apiIndex: Int? = null,
+        mainPageCache: MutableMap<String, HomePageResponse?> = mutableMapOf()
+    ) {
 
         if (plugin != null) {
             genreNames = withContext(Dispatchers.IO) { Tmdb.genres().associate { it.id to it.name } }
@@ -391,32 +780,30 @@ class TmdbHomeFragment : Fragment() {
             val apis = withContext(Dispatchers.IO) {
                 CsRuntime.apisFor(requireContext(), plugin)
             }
-            for (api in apis) {
+            val targets = if (apiIndex != null) {
+                listOfNotNull(apis.getOrNull(apiIndex)?.let { apiIndex to it })
+            } else {
+                apis.mapIndexed { index, api -> index to api }
+            }
+            for ((index, api) in targets) {
+                val key = CsRuntime.sourceKey(plugin.id, index)
 
                 val pages = api.mainPage.filter { it.data.isNotBlank() }
                 for (page in pages) {
-                    val resp = runCatching {
-                        withContext(Dispatchers.IO) {
-                            api.getMainPage(1, MainPageRequest(page.name, page.data, page.horizontalImages))
-                        }
-                    }.getOrNull()
+                    val resp = fetchMainPage(api, index, MainPageRequest(page.name, page.data, page.horizontalImages), mainPageCache)
                     resp?.items?.forEach { list ->
                         list.list.take(10).forEach { sr ->
-                            bannerItems.add(BannerItem.Plugin(sr, plugin.id))
+                            bannerItems.add(BannerItem.Plugin(sr, key))
                         }
                     }
                     if (bannerItems.isNotEmpty()) break
                 }
 
                 if (bannerItems.isEmpty()) {
-                    val resp = runCatching {
-                        withContext(Dispatchers.IO) {
-                            api.getMainPage(1, MainPageRequest("Home", "", false))
-                        }
-                    }.getOrNull()
+                    val resp = fetchMainPage(api, index, MainPageRequest("Home", "", false), mainPageCache)
                     resp?.items?.forEach { list ->
                         list.list.take(10).forEach { sr ->
-                            bannerItems.add(BannerItem.Plugin(sr, plugin.id))
+                            bannerItems.add(BannerItem.Plugin(sr, key))
                         }
                     }
                 }
@@ -427,7 +814,7 @@ class TmdbHomeFragment : Fragment() {
                     }.getOrNull()
                     if (!quick.isNullOrEmpty()) {
                         quick.take(10).forEach { sr ->
-                            bannerItems.add(BannerItem.Plugin(sr, plugin.id))
+                            bannerItems.add(BannerItem.Plugin(sr, key))
                         }
                     }
                 }
@@ -651,7 +1038,7 @@ class TmdbHomeFragment : Fragment() {
     private fun openBannerItem(item: BannerItem) {
         when (item) {
 
-            is BannerItem.Tmdb -> openDetails(item.media.type, item.media.id)
+            is BannerItem.Tmdb -> openMedia(item.media)
             is BannerItem.Plugin -> {
                 if (item.tmdbId != null && item.tmdbType != null) {
                     openDetails(item.tmdbType, item.tmdbId)
@@ -666,50 +1053,78 @@ class TmdbHomeFragment : Fragment() {
         }
     }
 
-    private suspend fun loadPluginSections(source: CsInstalledSource): Boolean {
+    private suspend fun fetchMainPage(
+        api: MainAPI,
+        apiIndex: Int,
+        request: MainPageRequest,
+        cache: MutableMap<String, HomePageResponse?>
+    ): HomePageResponse? {
+        val key = "$apiIndex|${request.name}|${request.data}|${request.horizontalImages}"
+        if (cache.containsKey(key)) return cache[key]
+        val response = runCatching {
+            withContext(Dispatchers.IO) {
+                api.getMainPage(1, request)
+            }
+        }.getOrNull()
+        cache[key] = response
+        return response
+    }
+
+    private suspend fun loadPluginSections(
+        source: CsInstalledSource,
+        apiIndex: Int? = null,
+        mainPageCache: MutableMap<String, HomePageResponse?> = mutableMapOf()
+    ): Boolean {
         val apis = withContext(Dispatchers.IO) {
             CsRuntime.apisFor(requireContext(), source)
         }
         if (apis.isEmpty()) return false
+        val targets = if (apiIndex != null) {
+            listOfNotNull(apis.getOrNull(apiIndex)?.let { apiIndex to it })
+        } else {
+            apis.mapIndexed { index, api -> index to api }
+        }
         var added = false
-        for (api in apis) {
+        for ((index, api) in targets) {
+            val apiKey = CsRuntime.sourceKey(source.id, index)
+            var apiAdded = false
 
             val pages = api.mainPage.filter { it.data.isNotBlank() }
             if (pages.isNotEmpty()) {
                 for (page in pages) {
-                    val resp = runCatching {
-                        withContext(Dispatchers.IO) {
-                            api.getMainPage(1, MainPageRequest(page.name, page.data, page.horizontalImages))
-                        }
-                    }.getOrNull()
+                    val resp = fetchMainPage(api, index, MainPageRequest(page.name, page.data, page.horizontalImages), mainPageCache)
                     resp?.items?.forEach { list ->
                         if (list.list.isNotEmpty()) {
-                            addPluginSection(list.name, list.list, source)
+                            addPluginSection(
+                                list.name, list.list, apiKey, list.isHorizontalImages,
+                                sectionKey = "$index:${list.name}"
+                            )
                             added = true
+                            apiAdded = true
                         }
                     }
                 }
             } else {
 
-                val resp = runCatching {
-                    withContext(Dispatchers.IO) {
-                        api.getMainPage(1, MainPageRequest("Home", "", false))
-                    }
-                }.getOrNull()
+                val resp = fetchMainPage(api, index, MainPageRequest("Home", "", false), mainPageCache)
                 resp?.items?.forEach { list ->
                     if (list.list.isNotEmpty()) {
-                        addPluginSection(list.name, list.list, source)
+                        addPluginSection(
+                            list.name, list.list, apiKey, list.isHorizontalImages,
+                            sectionKey = "$index:${list.name}"
+                        )
                         added = true
+                        apiAdded = true
                     }
                 }
             }
 
-            if (!added) {
+            if (!apiAdded) {
                 val quick = runCatching {
                     withContext(Dispatchers.IO) { api.quickSearch("") }
                 }.getOrNull()
                 if (!quick.isNullOrEmpty()) {
-                    addPluginSection("Popular", quick, source)
+                    addPluginSection("Popular", quick, apiKey, false, sectionKey = "$index:Popular")
                     added = true
                 }
             }
@@ -752,14 +1167,9 @@ class TmdbHomeFragment : Fragment() {
         if (Simkl.token == null) return
         val items = withContext(Dispatchers.IO) { Simkl.getContinueWatching() }
         if (items.isEmpty()) return
+        if (_binding == null) return
         val ctx = requireContext()
-        val header = TextView(ctx).apply {
-            text = "Continue Watching"
-            setPadding(24, 14, 24, 8)
-            textSize = 16f
-            setTypeface(android.graphics.Typeface.DEFAULT_BOLD)
-            setTextColor(ctx.getThemeColor(com.google.android.material.R.attr.colorOnSurface))
-        }
+        val header = sectionHeader(ctx, "Continue Watching")
         val list = RecyclerView(ctx).apply {
             setTag(R.id.section_row_tag, true)
             layoutManager = LinearLayoutManager(ctx, LinearLayoutManager.HORIZONTAL, false)
@@ -772,6 +1182,7 @@ class TmdbHomeFragment : Fragment() {
                             .putExtra(TmdbDetailsActivity.ARG_MEDIA_TYPE, mediaType)
                             .putExtra(TmdbDetailsActivity.ARG_MEDIA_ID, tmdbId)
                             .putExtra(TmdbDetailsActivity.ARG_OPEN_TAB, 1)
+                            .putExtra(TmdbDetailsActivity.ARG_FROM_CONTINUE, true)
                     )
                 },
                 simklMoreAdapter(items, "Continue Watching")
@@ -786,6 +1197,7 @@ class TmdbHomeFragment : Fragment() {
         }
         binding.tmdbHomeSections.addView(header)
         binding.tmdbHomeSections.addView(list)
+        registerSection("continue", listOf(header, list))
     }
 
     private suspend fun loadSimklHomeSections() = coroutineScope {
@@ -795,12 +1207,12 @@ class TmdbHomeFragment : Fragment() {
         } else emptyList()
 
         val favourites = all.filter { (it.userRating ?: 0) >= 9 }
-        if (favourites.isNotEmpty()) addSimklSection("Favourites", favourites)
+        if (favourites.isNotEmpty()) addSimklSection("Favourites", favourites, "favorites")
         val planned = all.filter {
             val s = it.status?.lowercase()
             s == "plantowatch" || s == "planning"
         }
-        if (planned.isNotEmpty()) addSimklSection("Planned", planned)
+        if (planned.isNotEmpty()) addSimklSection("Planned", planned, "planned")
         loadRecommended(all)
         startAutoAdvance()
         applyTmdbBannerFocusChain()
@@ -843,16 +1255,15 @@ class TmdbHomeFragment : Fragment() {
         if (recs.isNotEmpty()) addSection("Recommended", recs)
     }
 
-    private fun addSimklSection(title: String, items: List<Simkl.SimklWatchedItem>) {
+    private fun addSimklSection(
+        title: String,
+        items: List<Simkl.SimklWatchedItem>,
+        sectionKey: String = title.trim().lowercase(),
+    ) {
         if (items.isEmpty()) return
+        if (_binding == null) return
         val ctx = requireContext()
-        val header = TextView(ctx).apply {
-            text = title
-            setPadding(24, 14, 24, 8)
-            textSize = 16f
-            setTypeface(android.graphics.Typeface.DEFAULT_BOLD)
-            setTextColor(ctx.getThemeColor(com.google.android.material.R.attr.colorOnSurface))
-        }
+        val header = sectionHeader(ctx, title)
         val list = RecyclerView(ctx).apply {
             setTag(R.id.section_row_tag, true)
             layoutManager = LinearLayoutManager(ctx, LinearLayoutManager.HORIZONTAL, false)
@@ -873,10 +1284,12 @@ class TmdbHomeFragment : Fragment() {
         }
         binding.tmdbHomeSections.addView(header)
         binding.tmdbHomeSections.addView(list)
+        registerSection(sectionKey, listOf(header, list))
         applyTmdbBannerFocusChain()
     }
 
     private fun addEmptyState(text: String) {
+        if (_binding == null || !isAdded) return
         binding.tmdbHomeSections.addView(
             TextView(requireContext()).apply {
                 this.text = text
@@ -891,26 +1304,23 @@ class TmdbHomeFragment : Fragment() {
     private fun addPluginSection(
         title: String,
         items: List<SearchResponse>,
-        source: CsInstalledSource
+        sourceKey: String,
+        horizontal: Boolean,
+        sectionKey: String = title.trim().lowercase(),
     ) {
         if (items.isEmpty()) return
+        if (_binding == null) return
 
         if (title.contains("Continue Watching", ignoreCase = true)) return
         val ctx = requireContext()
-        val header = TextView(ctx).apply {
-            text = title
-            setPadding(24, 14, 24, 8)
-            textSize = 16f
-            setTypeface(android.graphics.Typeface.DEFAULT_BOLD)
-            setTextColor(ctx.getThemeColor(com.google.android.material.R.attr.colorOnSurface))
-        }
+        val header = sectionHeader(ctx, title)
         val list = RecyclerView(ctx).apply {
             setTag(R.id.section_row_tag, true)
             layoutManager = LinearLayoutManager(ctx, LinearLayoutManager.HORIZONTAL, false)
-            adapter = PluginRowAdapter(items) { item ->
+            adapter = PluginRowAdapter(items, horizontal) { item ->
                 startActivity(
                     Intent(requireContext(), TmdbDetailsActivity::class.java)
-                        .putExtra(TmdbDetailsActivity.ARG_PLUGIN_SOURCE, source.id)
+                        .putExtra(TmdbDetailsActivity.ARG_PLUGIN_SOURCE, sourceKey)
                         .putExtra(TmdbDetailsActivity.ARG_PLUGIN_URL, item.url)
                 )
             }
@@ -924,32 +1334,39 @@ class TmdbHomeFragment : Fragment() {
         }
         binding.tmdbHomeSections.addView(header)
         binding.tmdbHomeSections.addView(list)
+        registerSection(sectionKey, listOf(header, list))
     }
 
-    private fun addSection(title: String, items: List<TmdbMedia>) {
+    private fun addSection(
+        title: String,
+        items: List<TmdbMedia>,
+        onClick: ((TmdbMedia) -> Unit)? = null,
+        showMore: Boolean = true,
+        sectionKey: String = title.trim().lowercase(),
+    ) {
         if (items.isEmpty()) return
+        if (_binding == null) return
         val ctx = requireContext()
-        val header = TextView(ctx).apply {
-            text = title
-            setPadding(24, 14, 24, 8)
-            textSize = 16f
-            setTypeface(android.graphics.Typeface.DEFAULT_BOLD)
-            setTextColor(ctx.getThemeColor(com.google.android.material.R.attr.colorOnSurface))
-        }
+        val header = sectionHeader(ctx, title)
         val list = RecyclerView(ctx).apply {
             setTag(R.id.section_row_tag, true)
             layoutManager = LinearLayoutManager(ctx, LinearLayoutManager.HORIZONTAL, false)
-            val exploreList = ArrayList(items.map { it.toExploreMedia() })
-            adapter = ConcatAdapter(
-                TmdbRowAdapter(items) { media -> openDetails(media.type, media.id) },
-                SectionMoreAdapter {
-                    MediaListViewActivity.passedMedia = exploreList
-                    startActivity(
-                        Intent(requireContext(), MediaListViewActivity::class.java)
-                            .putExtra("title", title)
-                    )
-                }
-            )
+            val row = TmdbRowAdapter(items) { media ->
+                if (onClick != null) onClick(media) else openDetails(media.type, media.id)
+            }
+            adapter = if (showMore) {
+                val exploreList = ArrayList(items.map { it.toExploreMedia() })
+                ConcatAdapter(
+                    row,
+                    SectionMoreAdapter {
+                        MediaListViewActivity.passedMedia = exploreList
+                        startActivity(
+                            Intent(requireContext(), MediaListViewActivity::class.java)
+                                .putExtra("title", title)
+                        )
+                    }
+                )
+            } else row
             isNestedScrollingEnabled = false
             overScrollMode = View.OVER_SCROLL_NEVER
             setPadding(24, 0, 24, 0)
@@ -960,10 +1377,12 @@ class TmdbHomeFragment : Fragment() {
         }
         binding.tmdbHomeSections.addView(header)
         binding.tmdbHomeSections.addView(list)
+        registerSection(sectionKey, listOf(header, list))
         applyTmdbBannerFocusChain()
     }
 
     private fun showBanner(index: Int) {
+        if (_binding == null) return
         val item = bannerItems.getOrNull(index) ?: return
         bannerIndex = index
         binding.tmdbBannerImage.loadImage(item.bannerUrl)
@@ -986,6 +1405,7 @@ class TmdbHomeFragment : Fragment() {
         binding.tmdbBannerSynopsis.isVisible = !isPortrait && !largeBanner && synopsis.isNotBlank()
         binding.tmdbBannerSideSynopsis.text = synopsis
         binding.tmdbBannerSideSynopsis.isVisible = !largeBanner && synopsis.isNotBlank()
+        fitPanelSynopsis(binding.tmdbBannerSide, binding.tmdbBannerSideSynopsis, floorLines = 2)
         val genreText = when (item) {
             is BannerItem.Tmdb -> item.media.genreIds.take(3).mapNotNull { genreNames[it] }.joinToString("  •  ")
             is BannerItem.Plugin -> ""
@@ -1272,6 +1692,7 @@ class TmdbHomeFragment : Fragment() {
             }
             binding.tmdbBannerImage.scaleType = ImageView.ScaleType.CENTER_CROP
             binding.tmdbBannerContent.isVisible = false
+            fitPanelSynopsis(binding.tmdbBannerSide, binding.tmdbBannerSideSynopsis, floorLines = 2)
         } else {
             card.sizeBannerCard()
             val (cardW, cardH) = card.bannerCardSizePx()
@@ -1365,6 +1786,7 @@ class TmdbHomeFragment : Fragment() {
 
     class PluginRowAdapter(
         private val items: List<SearchResponse>,
+        private val horizontal: Boolean,
         private val onClick: (SearchResponse) -> Unit
     ) : RecyclerView.Adapter<PluginRowAdapter.VH>() {
 
@@ -1379,11 +1801,11 @@ class TmdbHomeFragment : Fragment() {
         override fun onBindViewHolder(holder: VH, position: Int) {
             val item = items[position]
             val b = holder.binding
-            val landscape = TmdbCards.isLandscapeOrientation()
+            val landscape = horizontal || TmdbCards.isLandscapeOrientation()
             val size = TmdbCards.cardSize()
-            val isLive = item is LiveSearchResponse
-            val (w, h) = if (landscape || isLive) {
-                (260f * size).toInt() to (148f * size).toInt()
+            val (w, h) = if (landscape) {
+                val width = 260f * size
+                width.toInt() to (width * 114f / 180f).toInt()
             } else {
                 (102f * size).toInt() to (154f * size).toInt()
             }
@@ -1392,7 +1814,7 @@ class TmdbHomeFragment : Fragment() {
                 height = h
             }
             b.tmdbCard.radius = TmdbCards.roundness()
-            b.tmdbCardPoster.loadImage(item.posterUrl, if (landscape || isLive) 780 else 300)
+            b.tmdbCardPoster.loadImage(item.posterUrl, if (landscape) 780 else 300)
 
             b.tmdbCardLogo.isVisible = false
             b.tmdbCardOverlayTitle.isVisible = false

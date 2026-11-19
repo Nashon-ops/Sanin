@@ -30,13 +30,16 @@ data class TmdbMedia(
     @SerialName("backdrop_path") val backdropPath: String? = null,
     @SerialName("vote_average") val voteAverage: Double = 0.0,
     @SerialName("vote_count") val voteCount: Int = 0,
+    val popularity: Double = 0.0,
     @SerialName("release_date") val releaseDate: String? = null,
     @SerialName("first_air_date") val firstAirDate: String? = null,
     val overview: String? = null,
     @SerialName("genre_ids") val genreIds: List<Int> = emptyList(),
     @SerialName("media_type") val mediaType: String? = null,
     @SerialName("belongs_to_collection") val collection: TmdbCollection? = null,
-    val adult: Boolean = false
+    val adult: Boolean = false,
+    val imdbId: String? = null,
+    val sourceAddonUrl: String? = null
 ) {
     val displayTitle: String get() = title ?: name ?: ""
     val year: String get() = (releaseDate ?: firstAirDate ?: "").take(4)
@@ -51,6 +54,12 @@ data class TmdbPage<T>(
     val results: List<T> = emptyList(),
     @SerialName("total_pages") val totalPages: Int = 1,
     @SerialName("total_results") val totalResults: Int = 0
+)
+
+@Serializable
+data class TmdbFindResult(
+    @SerialName("movie_results") val movieResults: List<TmdbMedia> = emptyList(),
+    @SerialName("tv_results") val tvResults: List<TmdbMedia> = emptyList(),
 )
 
 @Serializable
@@ -166,12 +175,15 @@ data class TmdbDetail(
     val tagline: String? = null,
     val status: String? = null,
     @SerialName("vote_average") val voteAverage: Double = 0.0,
+    @SerialName("vote_count") val voteCount: Int = 0,
+    val popularity: Double = 0.0,
     @SerialName("backdrop_path") val backdropPath: String? = null,
     @SerialName("poster_path") val posterPath: String? = null,
     @SerialName("release_date") val releaseDate: String? = null,
     @SerialName("first_air_date") val firstAirDate: String? = null,
     @SerialName("number_of_seasons") val numberOfSeasons: Int = 0,
     @SerialName("number_of_episodes") val numberOfEpisodes: Int = 0,
+    val runtime: Int? = null,
         val genres: List<TmdbGenre> = emptyList(),
         @SerialName("production_companies") val productionCompanies: List<TmdbCompany> = emptyList(),
         @SerialName("networks") val networks: List<TmdbCompany> = emptyList(),
@@ -189,7 +201,7 @@ data class TmdbDetail(
 ) {
     val displayTitle: String get() = title ?: name ?: ""
     val year: String get() = (releaseDate ?: firstAirDate ?: "").take(4)
-
+    val runtimeMinutes: Int? get() = runtime?.takeIf { it > 0 }
     val sortDate: String? get() = releaseDate ?: firstAirDate
 }
 
@@ -329,8 +341,11 @@ data class TmdbEpisode(
     @SerialName("season_number") val seasonNumber: Int = 0,
     @SerialName("still_path") val stillPath: String? = null,
     @SerialName("air_date") val airDate: String? = null,
-    @SerialName("vote_average") val voteAverage: Double = 0.0
-)
+    @SerialName("vote_average") val voteAverage: Double = 0.0,
+    val runtime: Int? = null
+) {
+    val runtimeMinutes: Int? get() = runtime?.takeIf { it > 0 }
+}
 
 @Serializable
 private data class TmdbGenrePage(val genres: List<TmdbGenre> = emptyList())
@@ -411,6 +426,18 @@ object Tmdb {
         return runCatching { json.decodeFromString<TmdbPage<TmdbMedia>>(body).results }
             .getOrDefault(emptyList())
             .filter { it.mediaType != "person" }
+    }
+
+    suspend fun findByImdb(imdbId: String, mediaType: String? = null): TmdbMedia? {
+        val normalized = imdbId.trim()
+        if (normalized.isEmpty()) return null
+        val body = get("/find/$normalized", "external_source" to "imdb_id") ?: return null
+        val parsed = runCatching { json.decodeFromString<TmdbFindResult>(body) }.getOrNull() ?: return null
+        return when (mediaType) {
+            "movie" -> parsed.movieResults.firstOrNull()
+            "tv" -> parsed.tvResults.firstOrNull()
+            else -> parsed.movieResults.firstOrNull() ?: parsed.tvResults.firstOrNull()
+        }
     }
 
     suspend fun trending(mediaType: String = "all", timeWindow: String = "week"): List<TmdbMedia> {
@@ -669,6 +696,7 @@ object Tmdb {
     }
 
     suspend fun detail(mediaType: String, id: Int): TmdbDetail? {
+        if (id <= 0) return null
         val body = get(
             "/$mediaType/$id",
             "language" to "en-US",
@@ -678,6 +706,7 @@ object Tmdb {
     }
 
     suspend fun videos(mediaType: String, id: Int): List<TmdbVideo> {
+        if (id <= 0) return emptyList()
         val body = get("/$mediaType/$id/videos", "language" to "en-US") ?: return emptyList()
         return runCatching { json.decodeFromString<TmdbVideoPage>(body).results }.getOrDefault(emptyList())
     }
@@ -688,6 +717,7 @@ object Tmdb {
     }
 
     suspend fun episodes(mediaType: String, id: Int, season: Int): List<TmdbEpisode> {
+        if (id <= 0) return emptyList()
         val body = get("/$mediaType/$id/season/$season", "language" to "en-US") ?: return emptyList()
         return runCatching {
             json.decodeFromString<TmdbSeasonDetail>(body).episodes
@@ -699,6 +729,7 @@ object Tmdb {
         .orEmpty()
 
     private suspend fun collectionDetail(id: Int): TmdbCollection? {
+        if (id <= 0) return null
         val body = get("/collection/$id") ?: return null
         return runCatching { json.decodeFromString<TmdbCollection>(body) }.getOrNull()
     }

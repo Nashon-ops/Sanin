@@ -25,6 +25,7 @@ import ani.sanin.connections.simkl.Simkl
 import ani.sanin.connections.tmdb.Tmdb
 import ani.sanin.connections.tmdb.TmdbDetail
 import ani.sanin.connections.tmdb.TmdbEpisode
+import ani.sanin.connections.tmdb.TmdbExternalIds
 import ani.sanin.connections.tmdb.TmdbGenre
 import ani.sanin.connections.tmdb.TmdbImage
 import ani.sanin.connections.tmdb.TmdbImages
@@ -55,7 +56,11 @@ import ani.sanin.toast
 import ani.sanin.util.FocusEffectUtil
 import ani.sanin.util.Logger
 import ani.sanin.util.customAlertDialog
+import ani.sanin.limitedAsyncMap
 import ani.sanin.settings.FAQActivity
+import ani.sanin.settings.StremioAddon
+import ani.sanin.settings.StremioAddonClient
+import ani.sanin.settings.StremioAddonManager
 import android.widget.LinearLayout
 import android.widget.ImageButton
 import com.google.android.material.chip.Chip
@@ -79,8 +84,12 @@ class TmdbWatchFragment : Fragment() {
     companion object {
         const val ARG_MEDIA_TYPE = "mediaType"
         const val ARG_MEDIA_ID = "mediaId"
+        const val ARG_IMDB_ID = "imdbId"
+        const val ARG_SOURCE_ADDON = "sourceAddon"
+        const val ARG_TITLE = "title"
         const val ARG_PLUGIN_SOURCE = "pluginSource"
         const val ARG_PLUGIN_URL = "pluginUrl"
+        const val ARG_AUTO_CONTINUE = "autoContinue"
         private const val EPISODE_CAP = 24
 
         private const val HEADER_ITEM_COUNT = 1
@@ -89,13 +98,21 @@ class TmdbWatchFragment : Fragment() {
             mediaType: String,
             mediaId: Int,
             pluginSourceId: String?,
-            pluginUrl: String?
+            pluginUrl: String?,
+            imdbId: String? = null,
+            sourceAddonUrl: String? = null,
+            title: String? = null,
+            autoContinue: Boolean = false,
         ): TmdbWatchFragment = TmdbWatchFragment().apply {
             arguments = Bundle().apply {
                 putString(ARG_MEDIA_TYPE, mediaType)
                 putInt(ARG_MEDIA_ID, mediaId)
                 pluginSourceId?.let { putString(ARG_PLUGIN_SOURCE, it) }
                 pluginUrl?.let { putString(ARG_PLUGIN_URL, it) }
+                imdbId?.let { putString(ARG_IMDB_ID, it) }
+                sourceAddonUrl?.let { putString(ARG_SOURCE_ADDON, it) }
+                title?.let { putString(ARG_TITLE, it) }
+                if (autoContinue) putBoolean(ARG_AUTO_CONTINUE, true)
             }
         }
     }
@@ -115,12 +132,16 @@ class TmdbWatchFragment : Fragment() {
     private lateinit var binding: FragmentTmdbWatchBinding
     private lateinit var headerBinding: ItemTmdbWatchHeaderBinding
     private var headerCountdownView: View? = null
+    private var headerContainer: View? = null
     private var headerCountdownTimer: CountDownTimer? = null
 
     private var mediaType: String = "movie"
     private var mediaId: Int = -1
     private var pluginSourceId: String? = null
     private var pluginUrl: String? = null
+    private var imdbId: String? = null
+    private var sourceAddonUrl: String? = null
+    private var argTitle: String? = null
     private var pluginLoad: LoadResponse? = null
     private val pluginEpisodes = mutableMapOf<Int, List<TmdbEpisode>>()
     private var detail: TmdbDetail? = null
@@ -130,6 +151,13 @@ class TmdbWatchFragment : Fragment() {
     private var movieEpisodes: List<TmdbEpisode> = emptyList()
 
     private val sources by lazy { CsRepos.installed(requireContext()) }
+
+    private var stremioSources: List<StremioAddon> = emptyList()
+    private var selectedStremioIndex = -1
+    private val selectedStremio get() = stremioSources.getOrNull(selectedStremioIndex)
+    private val stremioInfoOnly get() =
+        selectedStremio?.let { !StremioAddonClient.supports(it, "stream", mediaType) } == true
+    private val stremioExtrasOnly get() = selectedStremio?.extrasOnly == true
 
     private var selectedSourceIndex = -1
 
@@ -143,6 +171,13 @@ class TmdbWatchFragment : Fragment() {
     private val pluginMode get() = pluginUrl != null
 
     private lateinit var episodeAdapter: EpisodeListAdapter
+
+    private var extrasSheetActive = false
+    private var extrasSheet: SheetSourceSelector? = null
+    private var extrasSheetRows: List<ExtrasItem> = emptyList()
+    private var extrasJob: Job? = null
+    private var gridSpan = 4
+    private var autoContinuePending = false
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -160,6 +195,11 @@ class TmdbWatchFragment : Fragment() {
         mediaId = arguments?.getInt(ARG_MEDIA_ID, -1) ?: -1
         pluginSourceId = arguments?.getString(ARG_PLUGIN_SOURCE)
         pluginUrl = arguments?.getString(ARG_PLUGIN_URL)
+        imdbId = arguments?.getString(ARG_IMDB_ID)?.takeIf { it.isNotBlank() }
+        sourceAddonUrl = arguments?.getString(ARG_SOURCE_ADDON)?.takeIf { it.isNotBlank() }
+        argTitle = arguments?.getString(ARG_TITLE)?.takeIf { it.isNotBlank() }
+        autoContinuePending = savedInstanceState == null &&
+            (arguments?.getBoolean(ARG_AUTO_CONTINUE) ?: false)
 
         if (pluginUrl != null) mediaId = pluginUrl.hashCode()
         episodeStyle = (PrefManager.getNullableCustomVal("tmdb_style", 2, Int::class.java)
@@ -168,6 +208,29 @@ class TmdbWatchFragment : Fragment() {
         reversed = PrefManager.getNullableCustomVal("tmdb_reversed_$mediaId", false, Boolean::class.java)
             ?: false
         Logger.log("TMDB_WATCH: opened mediaType=$mediaType mediaId=$mediaId style=$episodeStyle reversed=$reversed")
+
+        val installedStremio = StremioAddonManager.installed()
+        stremioSources = installedStremio.filter { addon ->
+            StremioAddonClient.supportsStreams(addon, mediaType) &&
+                (StremioAddonClient.canResolveTmdbIds(addon, mediaType) || imdbId != null)
+        }
+        Logger.log(
+            "TMDB_WATCH: stremio sources for type=$mediaType: " +
+                stremioSources.joinToString { "${it.manifest.name}(${StremioAddonClient.capabilities(it)})" }
+        )
+        val excluded = installedStremio - stremioSources.toSet()
+        if (excluded.isNotEmpty()) {
+            Logger.log(
+                "TMDB_WATCH: excluded stremio sources: " + excluded.joinToString { addon ->
+                    val reason = when {
+                        !StremioAddonClient.supportsStreams(addon, mediaType) ->
+                            "no stream for $mediaType"
+                        else -> "id prefixes incompatible with TMDB"
+                    }
+                    "${addon.manifest.name} ($reason)"
+                }
+            )
+        }
 
         val hideScrollTop = PrefManager.getVal<Boolean>(PrefName.HideScrollTopButtons)
         binding.tmdbWatchBack.setOnClickListener { goBack() }
@@ -179,10 +242,10 @@ class TmdbWatchFragment : Fragment() {
 
         var maxGridSize = (resources.displayMetrics.widthPixels.dp / 100f).roundToInt()
         maxGridSize = max(4, maxGridSize - (maxGridSize % 2))
+        gridSpan = maxGridSize
         binding.tmdbWatchRecycler.layoutManager = GridLayoutManager(requireContext(), maxGridSize).apply {
             spanSizeLookup = object : GridLayoutManager.SpanSizeLookup() {
                 override fun getSpanSize(position: Int): Int = when {
-
                     position == 0 -> maxGridSize
                     episodeStyle == 3 -> 1
                     else -> maxGridSize
@@ -211,6 +274,12 @@ class TmdbWatchFragment : Fragment() {
 
     override fun onDestroyView() {
         cancelHeaderCountdown()
+        extrasJob?.cancel()
+        extrasJob = null
+        extrasSheetActive = false
+        extrasSheet = null
+        extrasSheetRows = emptyList()
+        headerContainer = null
         super.onDestroyView()
     }
 
@@ -251,18 +320,33 @@ class TmdbWatchFragment : Fragment() {
         binding.mediaBgGradient?.visibility = View.VISIBLE
     }
 
+    private fun emptyImdbDetail(): TmdbDetail {
+        Logger.log("TMDB_WATCH: meta exhausted for imdb=$imdbId addon=$sourceAddonUrl, showing empty watch tab")
+        return TmdbDetail(
+            id = mediaId,
+            title = if (mediaType == "movie") argTitle else null,
+            name = if (mediaType == "tv") argTitle else null,
+            externalIds = TmdbExternalIds(imdbId = imdbId),
+        )
+    }
+
     private fun load() {
         lifecycleScope.launch {
             if (pluginMode) {
                 loadPlugin()
                 return@launch
             }
-            val d = Tmdb.detail(mediaType, mediaId) ?: run {
+            val d = if (imdbId != null) {
+                ImdbMedia.loadDetail(mediaType, imdbId!!, sourceAddonUrl) ?: emptyImdbDetail()
+            } else {
+                Tmdb.detail(mediaType, mediaId)
+            } ?: run {
                 snackString("Could not load details")
                 goBack()
                 return@launch
             }
             detail = d
+            applyDefaultProvider()
             if (PrefManager.getVal<Boolean>(PrefName.ShowMediaBanner)) {
                 binding.mediaBg?.loadImage(bannerUrl(d))
             } else {
@@ -282,23 +366,36 @@ class TmdbWatchFragment : Fragment() {
             headerBinding = ItemTmdbWatchHeaderBinding.inflate(LayoutInflater.from(requireContext()))
 
             if (mediaType == "tv") {
-                seasons = Tmdb.seasons(mediaType, mediaId)
-                selectedSeason = restoreSeason()
-                episodes = Tmdb.episodes(mediaType, mediaId, selectedSeason)
+                when {
+                    stremioExtrasOnly -> episodes = emptyList()
+                    imdbId != null -> {
+                        seasons = ImdbMedia.loadDetail(mediaType, imdbId!!, sourceAddonUrl)?.seasons.orEmpty()
+                        selectedSeason = restoreSeason()
+                        episodes = ImdbMedia.episodesFor(mediaType, imdbId!!, selectedSeason, sourceAddonUrl)
+                    }
+                    else -> {
+                        seasons = Tmdb.seasons(mediaType, mediaId)
+                        selectedSeason = restoreSeason()
+                        episodes = Tmdb.episodes(mediaType, mediaId, selectedSeason)
+                    }
+                }
             } else {
-
-                movieEpisodes = listOf(
-                    TmdbEpisode(
-                        id = mediaId,
-                        name = d.displayTitle,
-                        episodeNumber = 1,
-                        seasonNumber = 1,
-                        stillPath = d.backdropPath ?: d.posterPath,
-                        airDate = d.releaseDate,
-                        voteAverage = d.voteAverage
+                if (stremioExtrasOnly) {
+                    movieEpisodes = emptyList()
+                } else {
+                    movieEpisodes = listOf(
+                        TmdbEpisode(
+                            id = mediaId,
+                            name = d.displayTitle,
+                            episodeNumber = 1,
+                            seasonNumber = 1,
+                            stillPath = d.backdropPath ?: d.posterPath,
+                            airDate = d.releaseDate,
+                            voteAverage = d.voteAverage
+                        )
                     )
-                )
-                loadCollectionParts(d)
+                    loadCollectionParts(d)
+                }
             }
 
             buildHeader()
@@ -306,19 +403,25 @@ class TmdbWatchFragment : Fragment() {
             updateContinueCard()
             loadSimklWatched()
 
-            autoSearchOnOpen()
+            autoSearchOnOpen(isInitialOpen = true)
         }
     }
 
     private suspend fun loadPlugin() {
         val url = pluginUrl ?: return
-        val source = sources.firstOrNull { it.id == pluginSourceId } ?: run {
+        val sourceId = pluginSourceId ?: run {
+            snackString("Plugin source missing")
+            goBack()
+            return
+        }
+        val baseId = CsRuntime.pluginIdOf(sourceId)
+        val source = sources.firstOrNull { it.id == baseId } ?: run {
             snackString("Plugin not installed anymore")
             goBack()
             return
         }
         val api = withContext(Dispatchers.IO) {
-            CsRuntime.apisFor(requireContext(), source).firstOrNull()
+            CsRuntime.apiFor(requireContext(), source, sourceId)
         } ?: run {
             snackString("Could not load ${source.name}")
             goBack()
@@ -421,7 +524,7 @@ class TmdbWatchFragment : Fragment() {
         buildAdapter()
         updateContinueCard()
         loadSimklWatched()
-        autoSearchOnOpen()
+        autoSearchOnOpen(isInitialOpen = true)
     }
 
     private fun buildPluginSeasons(load: TvSeriesLoadResponse): List<TmdbSeason> {
@@ -461,14 +564,6 @@ class TmdbWatchFragment : Fragment() {
             cal.get(java.util.Calendar.MONTH) + 1,
             cal.get(java.util.Calendar.DAY_OF_MONTH)
         )
-    }
-
-    private fun pluginShells(): Map<String, AnimeEpisode>? = if (!pluginMode) {
-        null
-    } else if (mediaType == "tv") {
-        TmdbStreamResolver.pluginEpisodeShells(mediaId, pluginEpisodes)
-    } else {
-        detail?.let { TmdbStreamResolver.pluginMovieShell(mediaId, it) }
     }
 
     private suspend fun loadCollectionParts(d: TmdbDetail) {
@@ -536,13 +631,16 @@ class TmdbWatchFragment : Fragment() {
     private fun buildHeader() {
         val h = headerBinding
 
-        if (selectedSourceIndex == -1) selectedSourceIndex = defaultSourceIndex()
         h.tmdbWatchSourceChips.removeAllViews()
-        h.tmdbWatchSourceTitle.text = when {
-            sources.isEmpty() -> getString(R.string.tmdb_watch_no_sources)
-            selectedSourceIndex == -1 -> getString(R.string.tmdb_watch_auto_search)
+        h.tmdbWatchSourceTitle.text = (when {
+            sources.isEmpty() && stremioSources.isEmpty() -> getString(R.string.tmdb_watch_no_sources)
+            selectedSourceIndex == -1 && selectedStremioIndex == -1 -> getString(R.string.tmdb_watch_auto_search)
             else -> getString(R.string.tmdb_watch_sources)
-        }
+        }) + sourceRowFiller()
+        Logger.log(
+            "TMDB_STATUS: buildHeader titleLen=${h.tmdbWatchSourceTitle.text.length} " +
+                "stremioIdx=$selectedStremioIndex csIdx=$selectedSourceIndex"
+        )
         sources.forEachIndexed { index, source ->
             val chip = LayoutInflater.from(requireContext()).inflate(R.layout.item_tmdb_chip, h.tmdbWatchSourceChips, false) as Chip
             chip.id = View.generateViewId()
@@ -555,10 +653,11 @@ class TmdbWatchFragment : Fragment() {
                     requireContext(), ani.sanin.R.color.chip_text_color
                 )
             )
-            chip.tag = index
-            if (index == selectedSourceIndex) chip.isChecked = true
+            chip.tag = "cs:$index"
+            if (selectedStremioIndex == -1 && index == selectedSourceIndex) chip.isChecked = true
             chip.setOnClickListener {
                 val nowChecked = chip.isChecked
+                selectedStremioIndex = -1
                 selectedSourceIndex = if (nowChecked) index else -1
                 saveSourcePref()
                 lastAutoSource = null
@@ -571,6 +670,50 @@ class TmdbWatchFragment : Fragment() {
                 centerOn(h.tmdbWatchSourceScroll, chip)
                 episodeAdapter.submitEpisodes(episodesOrMovie())
                 if (nowChecked) refreshSelected() else autoSearchOnOpen()
+            }
+            FocusEffectUtil.applyFocusListener(chip)
+            h.tmdbWatchSourceChips.addView(chip)
+        }
+        stremioSources.forEachIndexed { index, addon ->
+            val chip = LayoutInflater.from(requireContext()).inflate(R.layout.item_tmdb_chip, h.tmdbWatchSourceChips, false) as Chip
+            chip.id = View.generateViewId()
+            chip.text = addon.manifest.name
+            chip.isCheckable = true
+            chip.isClickable = true
+            chip.isFocusable = true
+            chip.setTextColor(
+                androidx.core.content.ContextCompat.getColorStateList(
+                    requireContext(), ani.sanin.R.color.chip_text_color
+                )
+            )
+            chip.tag = "st:$index"
+            if (selectedStremioIndex == index) chip.isChecked = true
+            chip.setOnClickListener {
+                val nowChecked = chip.isChecked
+                selectedSourceIndex = -1
+                selectedStremioIndex = if (nowChecked) index else -1
+                saveSourcePref()
+                lastAutoSource = null
+                TmdbStreamResolver.invalidateLinks(mediaId)
+                resolveJob?.cancel()
+                resolveJob = null
+                isResolving = false
+                refreshChips(h.tmdbWatchSourceChips)
+                centerOn(h.tmdbWatchSourceScroll, chip)
+                if (!nowChecked) {
+                    exitExtrasSheet()
+                    setSourceStatus(getString(R.string.tmdb_watch_sources))
+                    autoSearchOnOpen()
+                } else if (addon.extrasOnly == true) {
+                    startExtrasSheet(addon)
+                } else if (StremioAddonClient.supports(addon, "stream", mediaType)) {
+                    exitExtrasSheet()
+                    setSourceStatus(getString(R.string.tmdb_watch_sources))
+                    refreshSelected()
+                } else {
+                    exitExtrasSheet()
+                    showStremioInfo(addon)
+                }
             }
             FocusEffectUtil.applyFocusListener(chip)
             h.tmdbWatchSourceChips.addView(chip)
@@ -939,27 +1082,48 @@ class TmdbWatchFragment : Fragment() {
 
     private fun refreshChips(group: com.google.android.material.chip.ChipGroup) {
         group.post {
+            val sourceTag = if (selectedStremioIndex >= 0) "st:$selectedStremioIndex"
+                else if (selectedSourceIndex >= 0) "cs:$selectedSourceIndex" else null
             for (i in 0 until group.childCount) {
                 val chip = group.getChildAt(i) as Chip
-                chip.isChecked = chip.tag == if (group === headerBinding.tmdbWatchSeasonChips) selectedSeason else selectedSourceIndex
+                chip.isChecked = if (group === headerBinding.tmdbWatchSeasonChips) {
+                    chip.tag == selectedSeason
+                } else {
+                    sourceTag != null && chip.tag == sourceTag
+                }
             }
         }
     }
 
-    private fun defaultSourceIndex(): Int {
-
-        val savedId = PrefManager.getNullableCustomVal("tmdb_source_$mediaId", null, String::class.java)
-        if (!savedId.isNullOrEmpty()) {
-            val idx = sources.indexOfFirst { it.id == savedId }
-            if (idx >= 0) return idx
+    private fun applyDefaultProvider() {
+        if (selectedSourceIndex >= 0 || selectedStremioIndex >= 0) return
+        if (PrefManager.getVal<Boolean>(PrefName.SmartSourcePersistence)) {
+            val savedId = PrefManager.getNullableCustomVal("tmdb_source_$mediaId", null, String::class.java)
+            if (!savedId.isNullOrEmpty() && applyProviderId(savedId)) return
+            val lastId = PrefManager.getVal<String>(PrefName.LastTmdbSource)
+            if (lastId.isNotEmpty() && applyProviderId(lastId)) return
         }
         val preferredId = pluginSourceId
             ?: PrefManager.getVal<String>(PrefName.ContentSource).takeIf { it != "simkl" && it != "tmdb" }
-        if (preferredId != null) {
-            val idx = sources.indexOfFirst { it.id == preferredId }
-            if (idx >= 0) return idx
+        if (preferredId != null && applyProviderId(preferredId)) return
+        if (sources.isNotEmpty()) selectedSourceIndex = 0
+        else if (stremioSources.isNotEmpty()) selectedStremioIndex = 0
+    }
+
+    private fun applyProviderId(id: String): Boolean {
+        val csIdx = sources.indexOfFirst { it.id == CsRuntime.pluginIdOf(id) }
+        if (csIdx >= 0) {
+            selectedSourceIndex = csIdx
+            selectedStremioIndex = -1
+            return true
         }
-        return if (sources.isNotEmpty()) 0 else -1
+        val stIdx = stremioSources.indexOfFirst { StremioAddonManager.sourceId(it) == id }
+        if (stIdx >= 0) {
+            selectedSourceIndex = -1
+            selectedStremioIndex = stIdx
+            return true
+        }
+        return false
     }
 
     private fun updateNotifyIcon() {
@@ -972,12 +1136,17 @@ class TmdbWatchFragment : Fragment() {
 
     private fun setSourceStatus(text: String) {
 
-        val filler = "\u2800".repeat(120)
+        val filler = sourceRowFiller()
         headerBinding.tmdbWatchSourceTitle.ellipsize = TextUtils.TruncateAt.END
         headerBinding.tmdbWatchSourceTitle.isSelected = false
         headerBinding.tmdbWatchSourceTitle.text = text + filler
         headerBinding.tmdbWatchSpinner.isVisible = text.startsWith("Searching")
+        Logger.log(
+            "TMDB_STATUS: text='$text' fillerLen=${filler.length} fullLen=${(text + filler).length}"
+        )
     }
+
+    private fun sourceRowFiller(): String = "\u2800".repeat(120)
 
     private fun applyStyle(style: Int, rev: Boolean) {
         episodeStyle = style.coerceIn(0, 3)
@@ -993,7 +1162,8 @@ class TmdbWatchFragment : Fragment() {
         if (reversed) eps.reversed() else eps
 
     private fun episodesOrMovie(): List<TmdbEpisode> =
-        displayList(if (mediaType == "tv") episodes.take(EPISODE_CAP) else movieEpisodes)
+        if (stremioInfoOnly || stremioExtrasOnly) emptyList()
+        else displayList(if (mediaType == "tv") episodes.take(EPISODE_CAP) else movieEpisodes)
 
     private fun loadEpisodesForSeason() {
 
@@ -1047,6 +1217,7 @@ class TmdbWatchFragment : Fragment() {
         } else {
             header = headerBinding.root
         }
+        headerContainer = header
         episodeAdapter.setHeader(header)
     }
 
@@ -1096,127 +1267,244 @@ class TmdbWatchFragment : Fragment() {
         }
     }
 
+    private fun startExtrasSheet(addon: StremioAddon) {
+        if (!isAdded || !::episodeAdapter.isInitialized || !::headerBinding.isInitialized) return
+        val d = detail ?: return
+        extrasSheetActive = true
+        extrasJob?.cancel()
+        episodeAdapter.submitEpisodes(emptyList())
+        setSourceStatus("Searching extras from ${addon.manifest.name}…")
+        extrasSheet?.takeIf { it.isAdded }?.dismissAllowingStateLoss()
+        val picker = SheetSourceSelector.newInstanceLoading(
+            getString(R.string.tmdb_watch_fetching, addon.manifest.name),
+            grouped = false
+        )
+        extrasSheet = picker
+        picker.setHeader("More like this", addon.manifest.name)
+        picker.show(childFragmentManager, "tmdbWatchExtrasSheet")
+        extrasJob = lifecycleScope.launch {
+            val extras = StremioAddonManager.extrasSources()
+                .let { list ->
+                    if (list.any { it.transportUrl.equals(addon.transportUrl, ignoreCase = true) }) list
+                    else list + addon
+                }
+            val season = if (mediaType == "tv") selectedSeason else null
+            val ep = if (mediaType == "tv") 1 else null
+            val resolved = withContext(Dispatchers.IO) {
+                extras.map { extra ->
+                    val result = runCatching {
+                        TmdbStreamResolver.resolveStremio(extra, mediaType, mediaId, d, season, ep)
+                    }.getOrNull()
+                    extra to ((result as? TmdbStreamResolver.StreamResult.Success)?.links.orEmpty())
+                }
+            }
+            val targets = mutableListOf<Pair<String, String>>()
+            val infos = mutableListOf<ExtrasItem.Info>()
+            val seenInfo = HashSet<String>()
+            resolved.forEach { (_, links) ->
+                links.forEach { link ->
+                    val target = parseStremioTarget(link.externalUrl)
+                    if (target != null) {
+                        targets.add(target)
+                    } else {
+                        val key = link.label + "|" + link.details.orEmpty()
+                        if (seenInfo.add(key)) {
+                            infos.add(ExtrasItem.Info(link.label, link.details, link.externalUrl))
+                        }
+                    }
+                }
+            }
+            val recommendations = targets.distinct().limitedAsyncMap(4) { (type, imdb) ->
+                runCatching { Tmdb.findByImdb(imdb, type)?.copy(mediaType = type) }.getOrNull()
+            }.filterNotNull()
+                .filterNot { it.id == mediaId && it.mediaType == mediaType }
+                .distinctBy { "${it.mediaType}:${it.id}" }
+            if (!isAdded) return@launch
+            extrasSheetRows = buildList {
+                recommendations.forEach { add(ExtrasItem.Recommendation(it)) }
+                infos.forEach { add(it) }
+            }
+            val status = when {
+                recommendations.isNotEmpty() && infos.isNotEmpty() ->
+                    "${recommendations.size} recommendations · ${infos.size} info"
+                recommendations.isNotEmpty() -> "${recommendations.size} recommendations"
+                infos.isNotEmpty() -> "${infos.size} info"
+                else -> "No extras found"
+            }
+            setSourceStatus(status)
+            Logger.log(
+                "TMDB_WATCH: extras addons=${extras.size} recs=${recommendations.size} infos=${infos.size}"
+            )
+            Logger.log("TMDB_WATCH: extras sheet rows=${extrasSheetRows.size} addon=${addon.manifest.name}")
+            picker.setOnSelect { idx ->
+                val row = extrasSheetRows.getOrNull(idx) ?: return@setOnSelect
+                when (row) {
+                    is ExtrasItem.Recommendation -> {
+                        Logger.log(
+                            "TMDB_WATCH: extras sheet -> open '${row.media.displayTitle}' " +
+                                "(${row.media.mediaType}:${row.media.id})"
+                        )
+                        openExtrasMedia(row.media)
+                    }
+                    is ExtrasItem.Info -> row.url?.let { openExternalLink(it) }
+                }
+            }
+            picker.updateSources(extrasSheetRows.map { row ->
+                when (row) {
+                    is ExtrasItem.Recommendation -> {
+                        val m = row.media
+                        val year = m.year
+                        val genres = Tmdb.genreNames(m).joinToString(", ")
+                        val meta = listOf(
+                            year.takeIf { it.isNotBlank() },
+                            genres.takeIf { it.isNotBlank() },
+                        ).filterNotNull().joinToString(" · ")
+                        if (meta.isBlank()) m.displayTitle else "${m.displayTitle}  •  $meta"
+                    }
+                    is ExtrasItem.Info -> listOfNotNull(
+                        row.label,
+                        row.details?.lines()?.firstOrNull()?.takeIf(String::isNotBlank)
+                    ).joinToString("  •  ")
+                }
+            })
+        }
+    }
+
+    private fun exitExtrasSheet() {
+        if (!extrasSheetActive) return
+        extrasSheetActive = false
+        extrasJob?.cancel()
+        extrasJob = null
+        extrasSheetRows = emptyList()
+        extrasSheet?.takeIf { it.isAdded }?.dismissAllowingStateLoss()
+        extrasSheet = null
+        if (::episodeAdapter.isInitialized) episodeAdapter.submitEpisodes(episodesOrMovie())
+    }
+
+    private fun parseStremioTarget(url: String?): Pair<String, String>? {
+        if (url == null || !url.startsWith("stremio://", ignoreCase = true)) return null
+        val segments = android.net.Uri.parse(url).pathSegments
+        val rawType = segments.getOrNull(1) ?: return null
+        val rawId = segments.getOrNull(2) ?: return null
+        val type = if (rawType.equals("series", true) || rawType.equals("tv", true)) "tv" else "movie"
+        val imdbId = rawId.substringBefore(':').takeIf { it.startsWith("tt") } ?: return null
+        return type to imdbId
+    }
+
+    private fun openExtrasMedia(media: TmdbMedia) {
+        if (media.id <= 0 || !isAdded) return
+        val type = if (media.mediaType == "tv") "tv" else "movie"
+        Logger.log("TMDB_WATCH: opening extras item type=$type id=${media.id} '${media.displayTitle}'")
+        startActivity(
+            Intent(requireContext(), TmdbDetailsActivity::class.java)
+                .putExtra(TmdbDetailsActivity.ARG_MEDIA_TYPE, type)
+                .putExtra(TmdbDetailsActivity.ARG_MEDIA_ID, media.id)
+        )
+    }
+
+    private fun openExternalLink(url: String) {
+        if (!url.startsWith("stremio://", ignoreCase = true)) {
+            runCatching {
+                startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+            }.onFailure {
+                Logger.log("TMDB_WATCH: external open failed url=$url error=${it.message}")
+                snackString("No app can open this link")
+            }
+            return
+        }
+        val target = parseStremioTarget(url)
+        if (target == null) {
+            Logger.log("TMDB_WATCH: invalid stremio link url=$url")
+            return
+        }
+        val (typeHint, imdbId) = target
+        Logger.log("TMDB_WATCH: resolving stremio link type=$typeHint imdb=$imdbId")
+        lifecycleScope.launch {
+            val found = withContext(Dispatchers.IO) {
+                runCatching { Tmdb.findByImdb(imdbId, typeHint) }.getOrNull()
+            }
+            if (!isAdded) return@launch
+            if (found == null) {
+                Logger.log("TMDB_WATCH: stremio link unresolved id=$imdbId")
+                snackString("Could not resolve $imdbId on TMDB")
+                return@launch
+            }
+            startActivity(
+                Intent(requireContext(), TmdbDetailsActivity::class.java)
+                    .putExtra(TmdbDetailsActivity.ARG_MEDIA_TYPE, found.type)
+                    .putExtra(TmdbDetailsActivity.ARG_MEDIA_ID, found.id)
+            )
+        }
+    }
+
     private fun onEpisodeClick(episode: TmdbEpisode) {
 
-        if (isResolving && autoSearchJob?.isActive != true) return
+        if (extrasSheetActive) return
 
         if (!isAdded || childFragmentManager.isStateSaved) return
         autoSearchJob?.cancel()
         autoSearchJob = null
+        resolveJob?.cancel()
+        resolveJob = null
         isResolving = false
+        setSourceStatus(getString(R.string.tmdb_watch_sources))
+        selectedStremio?.let { addon ->
+            if (!StremioAddonClient.supports(addon, "stream", mediaType)) {
+                showStremioInfo(addon)
+                return
+            }
+        }
         val d = detail ?: return
         val season = if (mediaType == "tv") episode.seasonNumber.takeIf { it > 0 } ?: selectedSeason else null
         val ep = if (mediaType == "tv") episode.episodeNumber else null
         Logger.log(
             "TMDB_WATCH: episode click '${d.displayTitle}' season=$season ep=$ep " +
-                "sourceIdx=$selectedSourceIndex (${currentSourceName()})"
+                "sourceIdx=$selectedSourceIndex (${currentSourceName()}) -> streams screen"
         )
-        val sourceName = currentSourceName()
-        val fetchingLabel = getString(R.string.tmdb_watch_fetching, sourceName)
-        val groupingEnabled = PrefManager.getVal<Boolean>(PrefName.GroupServersByHostAndLanguageTags)
-        val picker = SheetSourceSelector.newInstanceLoading(fetchingLabel, grouped = groupingEnabled)
-        fun fillPicker(result: TmdbStreamResolver.StreamResult.Success) {
-            val labels = ArrayList(result.links.map { link ->
-                val host = link.host.takeIf { it.isNotBlank() }
-                val row = if (groupingEnabled && host != null && host != link.label) "$host - ${link.label}" else link.label
-                "$row  •  $sourceName"
-            })
-            picker.setOnSelect { idx ->
-                if (isAdded) {
-                    val link = result.links[idx]
-                    Logger.log(
-                        "TMDB_WATCH: opening player url=${link.url} " +
-                            "host=${runCatching { java.net.URI(link.url).host }.getOrNull() ?: "unknown"} " +
-                            "referer=${link.referer} headers=${link.headers}"
-                    )
-                    saveLastPlayed(season, ep)
-                    val source = sources.getOrNull(selectedSourceIndex) ?: lastAutoSource
-                    if (source == null) {
-                        snackString(getString(R.string.tmdb_watch_no_sources))
-                        return@setOnSelect
-                    }
-                    lifecycleScope.launch {
-                        TmdbStreamResolver.launchPlayer(
-                            requireContext(),
-                            mediaId,
-                            mediaType,
-                            d,
-                            source,
-                            season,
-                            ep,
-                            result.links,
-                            link.label,
-                            episodesOverride = pluginShells(),
-                            load = pluginLoad
-                        )
-                    }
-                }
-            }
-            picker.updateSources(labels)
+        val intent = Intent(requireContext(), TmdbServersActivity::class.java)
+            .putExtra(TmdbServersActivity.ARG_MEDIA_TYPE, mediaType)
+            .putExtra(TmdbServersActivity.ARG_MEDIA_ID, mediaId)
+            .putExtra(TmdbServersActivity.ARG_SEASON, season ?: 0)
+            .putExtra(TmdbServersActivity.ARG_EPISODE, ep ?: 0)
+        if (pluginSourceId != null) {
+            intent.putExtra(TmdbServersActivity.ARG_PLUGIN_SOURCE, pluginSourceId)
         }
-
-        var cached = TmdbStreamResolver.cachedLinks(mediaId, sourceName, season, ep)
-
-        if (cached == null) {
-            for (src in sources) {
-                val c = TmdbStreamResolver.cachedLinks(mediaId, src.name, season, ep)
-                if (c != null && c.links.isNotEmpty()) {
-                    Logger.log("TMDB_WATCH: fallback cached ${c.links.size} links via ${src.name} for S${season}E$ep (requested $sourceName)")
-                    cached = c
-                    break
-                }
-            }
+        if (pluginUrl != null) {
+            intent.putExtra(TmdbServersActivity.ARG_PLUGIN_URL, pluginUrl)
         }
-        if (cached != null && cached.links.isNotEmpty()) {
-            Logger.log(
-                "TMDB_WATCH: cached ${cached.links.size} links for " +
-                    "'${d.displayTitle}' S${season}E$ep via $sourceName"
-            )
-            setSourceStatus(
-                "${getString(R.string.found)} : ${cached.matchName ?: d.displayTitle} from $sourceName"
-            )
-            fillPicker(cached)
-            picker.show(childFragmentManager, "tmdbWatchServerSelector")
-            return
+        if (imdbId != null) {
+            intent.putExtra(TmdbServersActivity.ARG_IMDB_ID, imdbId)
         }
-        setSourceStatus(getString(R.string.tmdb_watch_searching, d.displayTitle))
-
-        picker.show(childFragmentManager, "tmdbWatchServerSelector")
-        isResolving = true
-        resolveJob?.cancel()
-        resolveJob = lifecycleScope.launch {
-            val result = withContext(Dispatchers.IO) { resolve(season, ep) }
-            isResolving = false
-            if (!isAdded || childFragmentManager.isStateSaved) {
-                Logger.log("TMDB_WATCH: discarding links, activity not showable")
-                return@launch
-            }
-            when (result) {
-                is TmdbStreamResolver.StreamResult.Error -> {
-                    setSourceStatus(getString(R.string.tmdb_watch_sources))
-                    Logger.log(android.util.Log.ERROR, "TMDB_WATCH: failed: ${result.message}")
-                    picker.updateSources(listOf("─── ${result.message} ───"))
-                }
-                is TmdbStreamResolver.StreamResult.Success -> {
-                    TmdbStreamResolver.cacheLinks(mediaId, sourceName, season, ep, result)
-                    setSourceStatus(
-                        "${if (selectedSourceIndex == -1) getString(R.string.found) else getString(R.string.selected)} : " +
-                            "${result.matchName ?: d.displayTitle} from $sourceName"
-                    )
-                    Logger.log(
-                        "TMDB_WATCH: ${result.links.size} links via $sourceName: " +
-                            result.links.mapIndexed { i, l -> "$i:${l.label}" }.joinToString(" | ")
-                    )
-                    fillPicker(result)
-                }
-            }
+        if (sourceAddonUrl != null) {
+            intent.putExtra(TmdbServersActivity.ARG_SOURCE_ADDON, sourceAddonUrl)
         }
+        startActivity(intent)
     }
 
-    private fun autoSearchOnOpen() {
+    private fun consumeAutoContinue(): Boolean {
+        val pending = autoContinuePending
+        autoContinuePending = false
+        return pending
+    }
+
+    private fun autoSearchOnOpen(isInitialOpen: Boolean = false) {
         autoSearchJob?.cancel()
-        if (isResolving) return
+        if (isResolving || extrasSheetActive) return
         val d = detail ?: return
+        if (isInitialOpen && !consumeAutoContinue()) {
+            setSourceStatus(getString(R.string.tmdb_watch_sources))
+            return
+        }
+        selectedStremio?.let { addon ->
+            if (addon.extrasOnly == true) {
+                startExtrasSheet(addon)
+                return
+            }
+            if (!StremioAddonClient.supports(addon, "stream", mediaType)) {
+                showStremioInfo(addon)
+                return
+            }
+        }
         val cwTarget = if (mediaType == "tv") continueTarget() else null
         val season = if (mediaType == "tv") cwTarget?.first ?: selectedSeason else null
 
@@ -1225,12 +1513,19 @@ class TmdbWatchFragment : Fragment() {
         setSourceStatus(getString(R.string.tmdb_watch_searching, d.displayTitle))
         isResolving = true
         autoSearchJob = lifecycleScope.launch {
-            val (source, result) = try {
+            val pair = try {
                 withContext(Dispatchers.IO) {
-                    if (sources.isEmpty()) {
+                    val stremioAddon = selectedStremio
+                    if (stremioAddon != null) {
+                        null to TmdbStreamResolver.resolveStremio(
+                            stremioAddon, mediaType, mediaId, d, season, resumeEp
+                        )
+                    } else if (sources.isEmpty()) {
                         null to TmdbStreamResolver.StreamResult.Error(getString(R.string.tmdb_watch_no_sources))
                     } else if (pluginMode) {
-                        val home = sources.firstOrNull { it.id == pluginSourceId }
+                        val home = sources.firstOrNull {
+                            it.id == CsRuntime.pluginIdOf(pluginSourceId ?: "")
+                        }
                         val load = pluginLoad
                         if (home != null && load != null) {
                             home to TmdbStreamResolver.resolvePluginStreams(
@@ -1250,6 +1545,8 @@ class TmdbWatchFragment : Fragment() {
                     isResolving = false
                 }
             }
+            val source = pair.first
+            val result = pair.second
             lastAutoSource = source
             when (result) {
                 is TmdbStreamResolver.StreamResult.Error -> {
@@ -1270,9 +1567,28 @@ class TmdbWatchFragment : Fragment() {
                     }
                     refreshChips(headerBinding.tmdbWatchSourceChips)
                     Logger.log("TMDB_WATCH: auto search found ${result.links.size} links via $foundName")
-                    snackString("${result.links.size} links found via $foundName")
+                    val playableCount = result.links.count { it.url.isNotBlank() }
+                    snackString(
+                        if (playableCount == 0) "${result.links.size} items found via $foundName"
+                        else "$playableCount links found via $foundName"
+                    )
 
                     TmdbStreamResolver.cacheLinks(mediaId, foundName, season, resumeEp, result)
+
+                    val infoOnly = playableCount == 0 && result.links.isNotEmpty() && result.links.none {
+                        it.externalUrl?.startsWith("stremio://", ignoreCase = true) == true
+                    }
+                    if (infoOnly) {
+                        Logger.log("TMDB_WATCH: $foundName is info-only, switching to extras sheet")
+                        val addon = selectedStremio
+                        if (addon != null) {
+                            StremioAddonManager.setExtrasOnly(addon.transportUrl, true)
+                            startExtrasSheet(addon)
+                        } else {
+                            snackString("Extra info from $foundName is ready — tap an episode")
+                        }
+                        return@launch
+                    }
 
                     if (!isAdded || childFragmentManager.isStateSaved) {
                         Logger.log("TMDB_WATCH: auto search landed after state saved, sheet skipped (links cached)")
@@ -1301,13 +1617,18 @@ class TmdbWatchFragment : Fragment() {
 
     private suspend fun resolve(season: Int?, ep: Int?): TmdbStreamResolver.StreamResult {
         val d = detail ?: return TmdbStreamResolver.StreamResult.Error("No title loaded")
+        selectedStremio?.let { addon ->
+            return TmdbStreamResolver.resolveStremio(addon, mediaType, mediaId, d, season, ep)
+        }
         if (selectedSourceIndex == -1) {
             if (sources.isEmpty()) {
                 return TmdbStreamResolver.StreamResult.Error(getString(R.string.tmdb_watch_no_sources))
             }
             if (pluginMode) {
 
-                val home = sources.firstOrNull { it.id == pluginSourceId }
+                val home = sources.firstOrNull {
+                    it.id == CsRuntime.pluginIdOf(pluginSourceId ?: "")
+                }
                 val load = pluginLoad
                 if (home != null && load != null) {
                     val result = TmdbStreamResolver.resolvePluginStreams(requireContext(), home, load, season, ep)
@@ -1322,18 +1643,28 @@ class TmdbWatchFragment : Fragment() {
         val source = sources.getOrNull(selectedSourceIndex)
             ?: return TmdbStreamResolver.StreamResult.Error("Source not found")
         val load = pluginLoad
-        if (pluginMode && source.id == pluginSourceId && load != null) {
+        if (pluginMode && source.id == CsRuntime.pluginIdOf(pluginSourceId ?: "") && load != null) {
             return TmdbStreamResolver.resolvePluginStreams(requireContext(), source, load, season, ep)
         }
         return TmdbStreamResolver.resolveStreams(requireContext(), source, d, season, ep)
     }
 
-    private fun currentSourceName(): String = when {
-        selectedSourceIndex == -1 -> lastAutoSource?.name ?: getString(R.string.tmdb_watch_auto_search)
-        else -> sources.getOrNull(selectedSourceIndex)?.name ?: getString(R.string.tmdb_watch_auto_search)
+    private fun currentSourceName(): String {
+        selectedStremio?.let { return it.manifest.name }
+        return when {
+            selectedSourceIndex == -1 -> lastAutoSource?.name ?: getString(R.string.tmdb_watch_auto_search)
+            else -> sources.getOrNull(selectedSourceIndex)?.name ?: getString(R.string.tmdb_watch_auto_search)
+        }
     }
 
     private fun refreshSelected() {
+        if (stremioExtrasOnly) {
+            selectedStremio?.let { addon ->
+                Logger.log("TMDB_WATCH: refresh in extras mode for ${addon.manifest.name}")
+                startExtrasSheet(addon)
+            }
+            return
+        }
         if (isResolving && autoSearchJob?.isActive != true) return
         autoSearchJob?.cancel()
         autoSearchJob = null
@@ -1477,13 +1808,37 @@ class TmdbWatchFragment : Fragment() {
     }
 
     private fun saveSourcePref() {
+        val remember = PrefManager.getVal<Boolean>(PrefName.SmartSourcePersistence)
 
+        selectedStremio?.let {
+            val id = StremioAddonManager.sourceId(it)
+            PrefManager.setCustomVal("tmdb_source_$mediaId", id)
+            if (remember) PrefManager.setVal(PrefName.LastTmdbSource, id)
+            return
+        }
         if (selectedSourceIndex == -1) {
             PrefManager.setCustomVal("tmdb_source_$mediaId", "")
             return
         }
         val source = sources.getOrNull(selectedSourceIndex) ?: return
         PrefManager.setCustomVal("tmdb_source_$mediaId", source.id)
+        if (remember) PrefManager.setVal(PrefName.LastTmdbSource, source.id)
+    }
+
+    private fun showStremioInfo(addon: StremioAddon) {
+        if (!::headerBinding.isInitialized) return
+        val description = addon.manifest.description.takeIf { it.isNotBlank() }
+            ?: "This add-on provides information only."
+        headerBinding.tmdbWatchSourceTitle.ellipsize = TextUtils.TruncateAt.END
+        headerBinding.tmdbWatchSourceTitle.isSelected = false
+        headerBinding.tmdbWatchSourceTitle.text = description + sourceRowFiller()
+        headerBinding.tmdbWatchSpinner.isVisible = false
+        headerBinding.tmdbWatchEpisodeCount.text = "Information only"
+        Logger.log(
+            "TMDB_STATUS: info-only text='${description.take(60)}' addon=${addon.manifest.name} filler=ON"
+        )
+        if (::episodeAdapter.isInitialized) episodeAdapter.submitEpisodes(emptyList())
+        snackString("${addon.manifest.name}: $description")
     }
 
     private fun updateContinueCard() {
@@ -1525,6 +1880,11 @@ class TmdbWatchFragment : Fragment() {
 
     private fun openWatch(type: String, id: Int) {
         host?.onWatchOpenTitle(type, id)
+    }
+
+    private sealed class ExtrasItem {
+        data class Recommendation(val media: TmdbMedia) : ExtrasItem()
+        data class Info(val label: String, val details: String?, val url: String?) : ExtrasItem()
     }
 
     private class EpisodeListAdapter(

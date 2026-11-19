@@ -14,11 +14,16 @@ import ani.sanin.connections.tmdb.Tmdb
 import ani.sanin.connections.tmdb.TmdbGenre
 import ani.sanin.databinding.BottomSheetTmdbFilterBinding
 import ani.sanin.media.SheetSourceSelector
+import ani.sanin.settings.StremioAddonClient
+import ani.sanin.settings.StremioAddonManager
 import ani.sanin.snackString
 import ani.sanin.util.FocusEffectUtil
 import ani.sanin.util.customAlertDialog
 import com.google.android.material.chip.Chip
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Calendar
 import java.util.Locale
 
@@ -93,6 +98,7 @@ class TmdbSearchFilterDialog : BottomSheetDialogFragment() {
     private val binding get() = _binding!!
     var onApply: ((TmdbFilterResult) -> Unit)? = null
     var onSourcesChanged: ((Set<String>) -> Unit)? = null
+    private var chipsJob: Job? = null
 
     private val selectedGenres = mutableListOf<Int>()
     private val selectedKeywords = mutableListOf<Int>()
@@ -389,11 +395,50 @@ class TmdbSearchFilterDialog : BottomSheetDialogFragment() {
     }
 
     private fun buildSourceChips() {
+        chipsJob?.cancel()
         val group = binding.tmdbFilterSources
         group.removeAllViews()
         group.addView(makeSourceChip("TMDB", TMDB_SOURCE))
-        CsRepos.installed(requireContext()).forEach { source ->
-            group.addView(makeSourceChip(source.name, source.id))
+        val ctx = requireContext().applicationContext
+        chipsJob = viewLifecycleOwner.lifecycleScope.launch {
+            val entries = withContext(Dispatchers.IO) {
+                val pluginEntries = mutableListOf<Pair<String, String>>()
+                CsRepos.installed(ctx).forEach { source ->
+                    val apis = runCatching { CsRuntime.apisFor(ctx, source) }
+                        .getOrNull().orEmpty()
+                    if (apis.size <= 1) {
+                        pluginEntries.add(source.name to source.id)
+                    } else {
+                        apis.forEachIndexed { index, api ->
+                            pluginEntries.add(
+                                (api.name.ifBlank { source.name }) to
+                                    CsRuntime.sourceKey(source.id, index)
+                            )
+                        }
+                    }
+                }
+                val stremioEntries = runCatching { StremioAddonManager.installed() }
+                    .getOrDefault(emptyList())
+                    .filter { StremioAddonClient.searchCatalogs(it).isNotEmpty() }
+                    .map { it.manifest.name to StremioAddonManager.sourceId(it) }
+                pluginEntries + stremioEntries
+            }
+            if (!isAdded) return@launch
+
+            val available = entries.map { it.second }.toMutableSet()
+            val missing = selectedSources.filter { it != TMDB_SOURCE && it !in available }
+            var changed = false
+            missing.forEach { id ->
+                val base = CsRuntime.pluginIdOf(id)
+                val replacement = entries.firstOrNull { it.second.startsWith("$base#") }?.second
+                if (replacement != null) {
+                    selectedSources.remove(id)
+                    selectedSources.add(replacement)
+                    changed = true
+                }
+            }
+            entries.forEach { (label, key) -> group.addView(makeSourceChip(label, key)) }
+            if (changed) onSourcesChanged?.invoke(selectedSources.toSet())
         }
     }
 

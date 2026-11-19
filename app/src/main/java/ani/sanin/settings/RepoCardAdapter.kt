@@ -6,8 +6,10 @@ import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.TextView
 import androidx.palette.graphics.Palette
 import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.ItemTouchHelper
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 import ani.sanin.R
@@ -27,12 +29,28 @@ data class RepoUi(
     val count: Int,
     val iconUrl: String? = null,
     val contentTypes: List<String> = emptyList(),
-    val languages: List<String> = emptyList()
+    val languages: List<String> = emptyList(),
+    val countText: String? = null,
+    val scopeLabel: String = "languages",
+    val description: String? = null,
+    val watermarkRes: Int? = null,
+    val watermarkLeft: Boolean = false,
+    val hideCount: Boolean = false,
+    val showInfoButton: Boolean = false,
+    val toggleVisible: Boolean = false,
+    val enabled: Boolean = true,
+    val dragVisible: Boolean = false,
+    val needsConfiguration: Boolean = false,
+    val configUrl: String? = null,
 ) {
     fun matches(q: String): Boolean {
         if (q.isBlank()) return true
-        return name.lowercase(Locale.ROOT).contains(q.lowercase(Locale.ROOT)) ||
-            url.lowercase(Locale.ROOT).contains(q.lowercase(Locale.ROOT))
+        val needle = q.lowercase(Locale.ROOT)
+        return name.lowercase(Locale.ROOT).contains(needle) ||
+            url.lowercase(Locale.ROOT).contains(needle) ||
+            description.orEmpty().lowercase(Locale.ROOT).contains(needle) ||
+            contentTypes.any { it.lowercase(Locale.ROOT).contains(needle) } ||
+            languages.any { it.lowercase(Locale.ROOT).contains(needle) }
     }
 }
 
@@ -50,8 +68,26 @@ class RepoCardAdapter(
     private val onOpen: (RepoUi) -> Unit,
     private val onLongClick: (RepoUi) -> Unit,
     private val countLabel: String = "plugins",
-    private val onExitTop: (() -> Boolean)? = null
+    private val onExitTop: (() -> Boolean)? = null,
+    private val actionLabel: String = "Browse",
+    private val onConfigure: ((RepoUi) -> Unit)? = null,
+    private val onToggle: ((RepoUi, Boolean) -> Unit)? = null,
+    private val onReorder: ((Int, Int) -> Unit)? = null,
 ) : ListAdapter<RepoUi, RepoCardAdapter.VH>(DIFF) {
+
+    private var reorderAnchor = RecyclerView.NO_POSITION
+    var reorderMessage: TextView? = null
+    var itemTouchHelper: ItemTouchHelper? = null
+    var onDragModeChanged: ((Boolean) -> Unit)? = null
+
+    fun disarmDrag(persist: Boolean) {
+        if (reorderAnchor == RecyclerView.NO_POSITION) return
+        val anchor = reorderAnchor
+        reorderAnchor = RecyclerView.NO_POSITION
+        reorderMessage?.visibility = View.GONE
+        onDragModeChanged?.invoke(false)
+        if (anchor != RecyclerView.NO_POSITION) notifyItemChanged(anchor)
+    }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
         val binding = ItemRepoCardBinding.inflate(LayoutInflater.from(parent.context), parent, false)
@@ -66,7 +102,28 @@ class RepoCardAdapter(
 
         holder.binding.repoName.text = item.name
 
-        holder.binding.repoCount.text = "${item.count} $countLabel"
+        if (item.hideCount) {
+            holder.binding.repoCount.visibility = View.GONE
+        } else {
+            holder.binding.repoCount.visibility = View.VISIBLE
+            holder.binding.repoCount.text = item.countText ?: "${item.count} $countLabel"
+        }
+        holder.binding.repoWatermark.setImageResource(item.watermarkRes ?: R.drawable.ic_github)
+        (holder.binding.repoWatermark.layoutParams as android.widget.FrameLayout.LayoutParams).let { lp ->
+            if (item.watermarkLeft) {
+                lp.gravity = android.view.Gravity.CENTER_VERTICAL or android.view.Gravity.START
+                lp.marginStart = (12 * ctx.resources.displayMetrics.density).toInt()
+                lp.marginEnd = 0
+                lp.bottomMargin = 0
+            } else {
+                lp.gravity = android.view.Gravity.BOTTOM or android.view.Gravity.END
+                val d = ctx.resources.displayMetrics.density
+                lp.marginStart = 0
+                lp.marginEnd = (12 * d).toInt()
+                lp.bottomMargin = (12 * d).toInt()
+            }
+            holder.binding.repoWatermark.layoutParams = lp
+        }
 
         holder.binding.repoContentTypes.removeAllViews()
         val chipTextColor = ctx.getThemeColor(com.google.android.material.R.attr.colorOnSurface)
@@ -95,8 +152,9 @@ class RepoCardAdapter(
         holder.binding.repoLanguages.removeAllViews()
         val languageCount = item.languages.size
         holder.binding.repoLanguages.addView(com.google.android.material.chip.Chip(ctx).apply {
-            text = languageCount.toString()
-            contentDescription = "$languageCount languages"
+            text = if (item.scopeLabel == "languages") languageCount.toString()
+                else "$languageCount ${item.scopeLabel}"
+            contentDescription = "$languageCount ${item.scopeLabel}"
             isClickable = false
             isFocusable = false
             textSize = 11f
@@ -121,6 +179,7 @@ class RepoCardAdapter(
 
         val skipIcons = PrefManager.getVal<Boolean>(PrefName.SkipExtensionIcons)
         if (!skipIcons && !item.iconUrl.isNullOrBlank()) {
+            holder.binding.repoLogo.setImageResource(R.drawable.ic_extension)
             Glide.with(ctx)
                 .asBitmap()
                 .load(item.iconUrl)
@@ -144,15 +203,16 @@ class RepoCardAdapter(
             holder.binding.repoLogo.setImageResource(R.drawable.ic_extension)
         }
 
+        val onPrimary = ctx.getThemeColor(com.google.android.material.R.attr.colorOnPrimary)
+        val borderWidth = (3f * ctx.resources.displayMetrics.density).toInt()
+
         with(holder.binding.repoBrowseButton) {
-            text = "Browse"
-            contentDescription = "Browse ${item.name}"
+            text = actionLabel
+            contentDescription = "$actionLabel ${item.name}"
             setOnClickListener { onOpen(item) }
             isFocusable = true
 
             backgroundTintList = null
-            val onPrimary = ctx.getThemeColor(com.google.android.material.R.attr.colorOnPrimary)
-            val borderWidth = (3f * resources.displayMetrics.density).toInt()
 
             fun styleBrowse(focused: Boolean) {
                 background = android.graphics.drawable.GradientDrawable().apply {
@@ -191,11 +251,172 @@ class RepoCardAdapter(
             }
         }
 
+        with(holder.binding.repoInfoButton) {
+            visibility = if (item.showInfoButton) View.VISIBLE else View.GONE
+            contentDescription = "Info ${item.name}"
+            setOnClickListener { onLongClick(item) }
+            setOnKeyListener { _, keyCode, event ->
+                if (event.action != KeyEvent.ACTION_DOWN) {
+                    false
+                } else {
+                    when (keyCode) {
+                        KeyEvent.KEYCODE_DPAD_DOWN -> moveBrowseFocus(holder, 1) { it.binding.repoInfoButton }
+                        KeyEvent.KEYCODE_DPAD_UP -> moveBrowseFocus(holder, -1) { it.binding.repoInfoButton }
+                        else -> false
+                    }
+                }
+            }
+        }
+
+        holder.binding.repoCardRoot.alpha = if (item.enabled) 1f else 0.45f
+
+        with(holder.binding.repoEnableToggle) {
+            visibility = if (item.toggleVisible && onToggle != null) View.VISIBLE else View.GONE
+            isChecked = item.enabled
+            jumpDrawablesToCurrentState()
+            contentDescription = if (item.enabled) "Disable ${item.name}" else "Enable ${item.name}"
+            setOnClickListener { onToggle?.invoke(item, !item.enabled) }
+            setOnKeyListener { _, keyCode, event ->
+                if (event.action != KeyEvent.ACTION_DOWN) {
+                    false
+                } else {
+                    when (keyCode) {
+                        KeyEvent.KEYCODE_DPAD_DOWN -> moveBrowseFocus(holder, 1) { it.binding.repoEnableToggle }
+                        KeyEvent.KEYCODE_DPAD_UP -> moveBrowseFocus(holder, -1) { it.binding.repoEnableToggle }
+                        else -> false
+                    }
+                }
+            }
+        }
+
+        with(holder.binding.repoDragHandle) {
+            visibility = if (item.dragVisible && onReorder != null) View.VISIBLE else View.GONE
+            contentDescription = "Reorder ${item.name}"
+            imageTintList = android.content.res.ColorStateList.valueOf(
+                if (holder.absoluteAdapterPosition == reorderAnchor) primaryColor else chipTextColor
+            )
+            setOnClickListener { v ->
+                val currentPos = holder.absoluteAdapterPosition
+                if (currentPos == RecyclerView.NO_POSITION) return@setOnClickListener
+                if (reorderAnchor == currentPos) {
+                    disarmDrag(persist = true)
+                } else {
+                    reorderAnchor = currentPos
+                    reorderMessage?.visibility = View.VISIBLE
+                    onDragModeChanged?.invoke(true)
+                    imageTintList = android.content.res.ColorStateList.valueOf(primaryColor)
+                    post { requestFocus() }
+                }
+            }
+            setOnTouchListener { _, event ->
+                if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN &&
+                    reorderAnchor == holder.absoluteAdapterPosition
+                ) {
+                    itemTouchHelper?.startDrag(holder)
+                }
+                false
+            }
+            setOnLongClickListener {
+                val currentPos = holder.absoluteAdapterPosition
+                if (currentPos == RecyclerView.NO_POSITION) return@setOnLongClickListener false
+                itemTouchHelper?.startDrag(holder)
+                true
+            }
+            setOnKeyListener { _, keyCode, event ->
+                if (event.action != KeyEvent.ACTION_DOWN) {
+                    false
+                } else {
+                    val currentPos = holder.absoluteAdapterPosition
+                    if (currentPos == RecyclerView.NO_POSITION) return@setOnKeyListener false
+                    val armed = reorderAnchor == currentPos
+                    when (keyCode) {
+                        KeyEvent.KEYCODE_DPAD_UP -> {
+                            if (armed) {
+                                if (currentPos > 0) {
+                                    onReorder?.invoke(currentPos, currentPos - 1)
+                                    reorderAnchor = currentPos - 1
+                                }
+                                true
+                            } else {
+                                moveBrowseFocus(holder, -1) { it.binding.repoDragHandle }
+                            }
+                        }
+                        KeyEvent.KEYCODE_DPAD_DOWN -> {
+                            if (armed) {
+                                if (currentPos < itemCount - 1) {
+                                    onReorder?.invoke(currentPos, currentPos + 1)
+                                    reorderAnchor = currentPos + 1
+                                }
+                                true
+                            } else {
+                                moveBrowseFocus(holder, 1) { it.binding.repoDragHandle }
+                            }
+                        }
+                        KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                            if (armed) {
+                                disarmDrag(persist = true)
+                            }
+                            false
+                        }
+                        else -> false
+                    }
+                }
+            }
+        }
+
+        with(holder.binding.repoSettingsButton) {
+            visibility = if (onConfigure != null) View.VISIBLE else View.GONE
+            contentDescription = "Configure ${item.name}"
+
+            fun styleSettings(focused: Boolean) {
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                    setColor(if (focused) ctx.getThemeColor(com.google.android.material.R.attr.colorPrimary) else Color.WHITE)
+                    cornerRadius = 24f * ctx.resources.displayMetrics.density
+                }
+                foreground = if (focused) {
+                    android.graphics.drawable.GradientDrawable().apply {
+                        shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                        setColor(Color.TRANSPARENT)
+                        cornerRadius = 24f * ctx.resources.displayMetrics.density
+                        setStroke(borderWidth, onPrimary)
+                    }
+                } else {
+                    null
+                }
+                imageTintList = android.content.res.ColorStateList.valueOf(
+                    if (focused) onPrimary else Color.BLACK
+                )
+            }
+            styleSettings(false)
+            setOnFocusChangeListener { _, hasFocus ->
+                styleSettings(hasFocus)
+            }
+            setOnClickListener {
+                onConfigure?.invoke(item)
+            }
+            setOnKeyListener { _, keyCode, event ->
+                if (event.action != KeyEvent.ACTION_DOWN) {
+                    false
+                } else {
+                    when (keyCode) {
+                        KeyEvent.KEYCODE_DPAD_DOWN -> moveBrowseFocus(holder, 1) { it.binding.repoSettingsButton }
+                        KeyEvent.KEYCODE_DPAD_UP -> moveBrowseFocus(holder, -1) { it.binding.repoSettingsButton }
+                        else -> false
+                    }
+                }
+            }
+        }
+
         holder.binding.repoCardRoot.isFocusable = false
         holder.binding.repoCardRoot.setOnLongClickListener { onLongClick(item); true }
     }
 
-    private fun moveBrowseFocus(holder: VH, delta: Int): Boolean {
+    private fun moveBrowseFocus(
+        holder: VH,
+        delta: Int,
+        request: (VH) -> View = { it.binding.repoBrowseButton },
+    ): Boolean {
         val rv = holder.itemView.parent as? RecyclerView ?: return false
         val current = holder.absoluteAdapterPosition
         if (current == RecyclerView.NO_POSITION) return false
@@ -204,7 +425,7 @@ class RepoCardAdapter(
         if (target >= itemCount) return false
         val vh = rv.findViewHolderForAdapterPosition(target) as? VH ?: return false
         if (vh.itemView.parent == null) return false
-        return vh.binding.repoBrowseButton.requestFocus()
+        return request(vh).requestFocus()
     }
 
     private fun applyGradient(view: View, topColor: Int, bottomColor: Int) {

@@ -21,7 +21,9 @@ import ani.sanin.util.LogcatBuffer
 import ani.sanin.util.Logger
 import ani.sanin.util.TvKeyboardUtil
 import com.lagradost.cloudstream3.CommonActivity
+import com.lagradost.cloudstream3.DownloaderTestImpl
 import com.google.android.material.color.DynamicColors
+import org.schabi.newpipe.extractor.NewPipe
 import eu.kanade.tachiyomi.data.notification.Notifications
 import eu.kanade.tachiyomi.extension.anime.AnimeExtensionManager
 import kotlinx.coroutines.CoroutineScope
@@ -62,6 +64,11 @@ class App : Application() {
             }
         }
         PrefManager.init(this)
+        Injekt.importModule(AppModule(this))
+        Injekt.importModule(PreferenceModule(this))
+        initializeNetwork()
+        runCatching { NewPipe.init(DownloaderTestImpl.getInstance()) }
+            .onFailure { Log.e("App", "Failed to initialize NewPipe downloader", it) }
         ani.sanin.download.DownloadManager.init(this)
 
         val crashlytics =
@@ -73,9 +80,6 @@ class App : Application() {
             LogcatBuffer.start()
             Logger.log(Log.WARN, "App: Logging started")
         }
-
-        Injekt.importModule(AppModule(this))
-        Injekt.importModule(PreferenceModule(this))
 
         val useMaterialYou: Boolean = PrefManager.getVal(PrefName.UseMaterialYou)
         if (useMaterialYou) {
@@ -92,8 +96,6 @@ class App : Application() {
             }
         }
         crashlytics.setCustomKey("device Info", SettingsActivity.getDeviceInfo())
-
-        initializeNetwork()
 
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
             runCatching { android.webkit.WebView(this).destroy() }

@@ -15,7 +15,10 @@ import ani.sanin.connections.tmdb.Tmdb
 import ani.sanin.connections.mal.MAL
 import ani.sanin.currContext
 import ani.sanin.media.anime.Episode
+import ani.sanin.media.anime.getEpisode
+import ani.sanin.media.anime.AnimeServersActivity
 import ani.sanin.media.anime.SelectorDialogFragment
+import ani.sanin.cloudstream.TmdbStreamResolver
 import ani.sanin.others.AniSkip
 import ani.sanin.others.Anify
 import ani.sanin.others.IntroDB
@@ -23,6 +26,7 @@ import ani.sanin.others.Jikan
 import ani.sanin.others.Kitsu
 import ani.sanin.others.TheIntroDB
 import ani.sanin.parsers.AnimeSources
+import ani.sanin.parsers.HAnimeSources
 import ani.sanin.parsers.ShowResponse
 import ani.sanin.parsers.VideoExtractor
 import ani.sanin.parsers.VideoServer
@@ -55,6 +59,12 @@ class MediaDetailsViewModel : ViewModel() {
             PrefManager.getNullableCustomVal("Selected-${media.id}", null, Selected::class.java)
                 ?: Selected().let {
                     it.sourceIndex = 0
+                    if (PrefManager.getVal<Boolean>(PrefName.SmartSourcePersistence)) {
+                        val lastName = PrefManager.getVal<String>(PrefName.LastAnimeSource)
+                        val sources = if (media.isAdult) HAnimeSources else AnimeSources
+                        val idx = sources.list.indexOfFirst { parser -> parser.name == lastName }
+                        if (idx >= 0) it.sourceIndex = idx
+                    }
                     it.preferDub = PrefManager.getVal(PrefName.PreferDub)
                     saveSelected(media.id, it)
                     it
@@ -704,6 +714,26 @@ class MediaDetailsViewModel : ViewModel() {
         episodes.postValue(epsLoaded)
     }
 
+    suspend fun episodeForSource(
+        media: Media,
+        sourceIndex: Int,
+        key: String,
+        number: String? = null,
+    ): Episode? {
+        val cached = epsLoaded[sourceIndex]
+        val map = if (!cached.isNullOrEmpty()) {
+            cached
+        } else {
+            Logger.log("Watch: loading episodes source idx=$sourceIndex for next episode '$key'")
+            val loaded = watchSources?.loadEpisodesFromMedia(sourceIndex, media) ?: return null
+            if (loaded.isEmpty()) return null
+            epsLoaded[sourceIndex] = loaded
+            loaded
+        }
+        return map.getEpisode(key)
+            ?: number?.let { n -> map.values.firstOrNull { it.number == n } }
+    }
+
     suspend fun forceLoadEpisode(media: Media, i: Int) {
         Logger.log("Watch: ViewModel forceLoadEpisode source idx=$i media='${media.name}'")
         epsLoaded[i] = watchSources?.loadEpisodesFromMedia(i, media) ?: return
@@ -979,32 +1009,25 @@ class MediaDetailsViewModel : ViewModel() {
             ep.extractorsSource = null
             ep.allStreams = false
         }
-        if (ep.extractors?.find { it.server.name == server || it.isPreferred } == null) {
+        val existing = ep.extractors?.filterNotNull()?.firstOrNull {
+            (it.server.name == server || it.isPreferred) && it.videos.isNotEmpty()
+        }
+        if (existing != null) {
+            ep.selectedExtractor = existing.server.name
+        } else {
             Logger.log("Watch: loading single video server '$server' for episode '${ep.number}' source idx=${selected.sourceIndex}")
-            if(ep.extractors == null){
-                ep.extractors = mutableListOf(watchSources?.get(selected.sourceIndex)?.let {
-                    selected.sourceIndex = selected.sourceIndex
-                    if (!post && !it.allowsPreloading) null
-                    else ep.sEpisode?.let { it1 ->
-                        it.loadSingleVideoServer(
-                            server, link, ep.extra,
-                            it1, post
-                        )
-                    }
-                } ?: return false)
+            val source = watchSources?.get(selected.sourceIndex) ?: return false
+            if (!post && !source.allowsPreloading) return false
+            val loaded = ep.sEpisode?.let {
+                source.loadSingleVideoServer(server, link, ep.extra, it, post)
+            } ?: return false
+            if (loaded.videos.isEmpty()) return false
+            if (ep.extractors == null) {
+                ep.extractors = mutableListOf(loaded)
+            } else {
+                ep.extractors!!.add(loaded)
             }
-            else{
-                ep.extractors!!.add(watchSources?.get(selected.sourceIndex)?.let {
-                    selected.sourceIndex = selected.sourceIndex
-                    if (!post && !it.allowsPreloading) null
-                    else ep.sEpisode?.let { it1 ->
-                        it.loadSingleVideoServer(
-                            server, link, ep.extra,
-                            it1, post
-                        )
-                    }
-                } ?: return false)
-            }
+            ep.selectedExtractor = loaded.server.name
             ep.allStreams = false
             ep.extractorsSource = selected.sourceIndex
         }
@@ -1050,7 +1073,25 @@ class MediaDetailsViewModel : ViewModel() {
                 Logger.log("Watch: opening selector for episode(s) ${episodes.joinToString(",")} source='${watchSources?.get(media.selected?.sourceIndex ?: 0)?.name}' (idx ${media.selected?.sourceIndex})")
                 media.selected = this.loadSelected(media)
 
+                val savedServer = media.selected!!.server
                 if (launch) media.selected!!.server = null
+                if (episodes.size == 1 &&
+                    TmdbStreamResolver.sessionFor(media.id) == null &&
+                    media.format != "LOCAL" && media.format != "LOCAL_NOVEL"
+                ) {
+                    AnimeServersActivity.media = media
+                    AnimeServersActivity.initialized = true
+                    val ctx = currContext() ?: return@post
+                    ctx.startActivity(
+                        android.content.Intent(ctx, AnimeServersActivity::class.java)
+                            .putExtra(AnimeServersActivity.ARG_EPISODE, i)
+                            .putExtra(AnimeServersActivity.ARG_PREV, prevEp)
+                            .putExtra(AnimeServersActivity.ARG_LAUNCH, launch)
+                            .putExtra(AnimeServersActivity.ARG_SERVER, media.selected!!.server)
+                            .putExtra(AnimeServersActivity.ARG_IS_DOWNLOAD, isDownload)
+                    )
+                    return@post
+                }
                 val selector =
                     SelectorDialogFragment.newInstance(
                         media.selected!!.server,

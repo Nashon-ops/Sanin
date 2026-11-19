@@ -7,6 +7,9 @@ import ani.sanin.FileUrl
 import ani.sanin.connections.tmdb.Tmdb
 import ani.sanin.connections.tmdb.TmdbDetail
 import ani.sanin.connections.tmdb.TmdbEpisode
+import ani.sanin.connections.tmdb.TmdbExternalIds
+import ani.sanin.connections.tmdb.TmdbGenre
+import ani.sanin.connections.tmdb.TmdbSeason
 import ani.sanin.media.Media
 import ani.sanin.media.Selected
 import ani.sanin.media.anime.Anime
@@ -19,6 +22,11 @@ import ani.sanin.parsers.VideoExtractor
 import ani.sanin.parsers.VideoServer
 import ani.sanin.parsers.DrmInfo
 import ani.sanin.parsers.VideoType
+import ani.sanin.settings.StremioAddon
+import ani.sanin.settings.StremioAddonClient
+import ani.sanin.settings.StremioAddonManager
+import ani.sanin.settings.StremioMetaDetails
+import ani.sanin.settings.StremioStream
 import ani.sanin.settings.saving.PrefManager
 import ani.sanin.settings.saving.PrefName
 import ani.sanin.util.Logger
@@ -31,7 +39,6 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvSeriesLoadResponse
 import com.lagradost.cloudstream3.isMovieType
 import com.lagradost.cloudstream3.LiveStreamLoadResponse
-import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.utils.DrmExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.CLEARKEY_DRM_UUID
@@ -41,6 +48,114 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+
+object ImdbMedia {
+
+
+    fun syntheticMediaId(imdbId: String): Int =
+        -1 - (imdbId.lowercase().hashCode() and 0x7FFFFFFF)
+
+    private val metaCache = HashMap<String, StremioMetaDetails>()
+
+    private suspend fun loadMeta(
+        mediaType: String,
+        imdbId: String,
+        sourceAddonUrl: String?,
+    ): StremioMetaDetails? {
+        val probes = buildList {
+            if (!sourceAddonUrl.isNullOrBlank()) {
+                StremioAddonManager.addonForSourceId("stremio:$sourceAddonUrl")
+                    ?.let { add(it) }
+            }
+            addAll(StremioAddonManager.metadataSources())
+        }.distinctBy { it.transportUrl }
+        for (addon in probes) {
+            val meta = runCatching {
+                StremioAddonClient.loadMeta(addon, mediaType, -1, imdbId)
+            }.getOrNull()
+            if (meta != null) return meta
+        }
+        return StremioAddonClient.loadCinemetaMeta(mediaType, imdbId)
+    }
+
+    private fun cacheKey(mediaType: String, imdbId: String) = "$mediaType:$imdbId"
+
+    private suspend fun cachedMeta(
+        mediaType: String,
+        imdbId: String,
+        sourceAddonUrl: String? = null,
+    ): StremioMetaDetails? {
+        val key = cacheKey(mediaType, imdbId)
+        val cached = synchronized(metaCache) { metaCache[key] }
+        if (cached != null) return cached
+        val meta = loadMeta(mediaType, imdbId, sourceAddonUrl) ?: return null
+        synchronized(metaCache) { metaCache[key] = meta }
+        return meta
+    }
+
+
+    suspend fun loadDetail(
+        mediaType: String,
+        imdbId: String,
+        sourceAddonUrl: String? = null,
+    ): TmdbDetail? {
+        val meta = cachedMeta(mediaType, imdbId, sourceAddonUrl) ?: return null
+        val year = Regex("\\d{4}").find(meta.releaseInfo.orEmpty())?.value
+        val seasons = meta.videos.asSequence()
+            .mapNotNull { it.season ?: 1 }
+            .distinct()
+            .sorted()
+            .map { s ->
+                TmdbSeason(
+                    id = syntheticMediaId("$imdbId:s$s"),
+                    name = "Season $s",
+                    seasonNumber = s,
+                    episodeCount = meta.videos.count { (it.season ?: 1) == s },
+                )
+            }
+            .toList()
+        return TmdbDetail(
+            id = syntheticMediaId(imdbId),
+            title = if (mediaType == "movie") meta.name else null,
+            name = if (mediaType == "movie") null else meta.name,
+            overview = meta.description,
+            posterPath = meta.poster,
+            backdropPath = meta.background,
+            voteAverage = meta.imdbRating?.toDoubleOrNull() ?: 0.0,
+            releaseDate = if (mediaType == "movie") year?.let { "$it-01-01" } else null,
+            firstAirDate = if (mediaType == "movie") null else year?.let { "$it-01-01" },
+            numberOfSeasons = seasons.size,
+            genres = meta.genres.mapIndexed { i, g -> TmdbGenre(i + 1, g) },
+            externalIds = TmdbExternalIds(imdbId = meta.id.ifBlank { imdbId }),
+            seasons = seasons,
+        )
+    }
+
+
+    suspend fun episodesFor(
+        mediaType: String,
+        imdbId: String,
+        season: Int,
+        sourceAddonUrl: String? = null,
+    ): List<TmdbEpisode> {
+        if (mediaType != "tv") return emptyList()
+        val meta = cachedMeta(mediaType, imdbId, sourceAddonUrl) ?: return emptyList()
+        return meta.videos
+            .filter { (it.season ?: 1) == season && (it.episode ?: 0) > 0 }
+            .sortedBy { it.episode ?: 0 }
+            .map { v ->
+                TmdbEpisode(
+                    id = syntheticMediaId(v.id),
+                    name = v.title ?: "Episode ${v.episode}",
+                    overview = v.overview,
+                    episodeNumber = v.episode ?: 0,
+                    seasonNumber = season,
+                    stillPath = v.thumbnail,
+                    airDate = v.released?.take(10),
+                )
+            }
+    }
+}
 
 object TmdbStreamResolver {
 
@@ -53,6 +168,9 @@ object TmdbStreamResolver {
             val drm: DrmInfo? = null,
             val audioTracks: List<AudioFile> = emptyList(),
             val host: String = "",
+            val externalUrl: String? = null,
+            val details: String? = null,
+            val rawDetails: String? = null,
         )
 
         data class Success(val links: List<PlayableLink>, val matchName: String? = null) : StreamResult()
@@ -61,6 +179,41 @@ object TmdbStreamResolver {
 
     fun syntheticId(mediaId: Int): Int = -1000000000 - (mediaId % 1000000)
 
+    suspend fun resolveStremio(
+        addon: StremioAddon,
+        mediaType: String,
+        mediaId: Int,
+        detail: TmdbDetail,
+        season: Int?,
+        episodeNumber: Int?,
+    ): StreamResult {
+        if (!StremioAddonClient.supports(addon, "stream", mediaType)) {
+            Logger.log("STREMIO: resolve skipped addon='${addon.manifest.name}' type=$mediaType (no stream)")
+            return StreamResult.Error("${addon.manifest.name} does not provide streams")
+        }
+        Logger.log(
+            "STREMIO: resolve addon='${addon.manifest.name}' type=$mediaType tmdb=$mediaId " +
+                "imdb=${detail.externalIds?.imdbId} S$season E$episodeNumber"
+        )
+        val streams = StremioAddonClient.loadStreams(
+            addon = addon,
+            tmdbType = mediaType,
+            tmdbId = mediaId,
+            imdbId = detail.externalIds?.imdbId,
+            season = season,
+            episode = episodeNumber,
+        )
+        val links = stremioLinks(streams, addon.manifest.name)
+        Logger.log(
+            "STREMIO: resolve result addon='${addon.manifest.name}' streams=${streams.size} playable=${links.size}"
+        )
+        return if (links.isEmpty()) {
+            StreamResult.Error("No playable streams found in ${addon.manifest.name}")
+        } else {
+            StreamResult.Success(links, detail.displayTitle)
+        }
+    }
+
     suspend fun resolveAuto(
         context: Context,
         sources: List<CsInstalledSource>,
@@ -68,7 +221,8 @@ object TmdbStreamResolver {
         season: Int?,
         episodeNumber: Int?
     ): Pair<CsInstalledSource?, StreamResult> {
-        for (source in sources) {
+        val candidates = if (PrefManager.getVal<Boolean>(PrefName.SearchSources)) sources else sources.take(1)
+        for (source in candidates) {
             val result = resolveStreams(context, source, d, season, episodeNumber)
             if (result is StreamResult.Success) return source to result
         }
@@ -260,16 +414,6 @@ object TmdbStreamResolver {
         Log.i("TmdbDetails", "${api.name}: search '${d.displayTitle}' -> ${results.size} results")
         var match = bestSearchMatch(results, d.displayTitle, wantMovie)
         Log.i("TmdbDetails", "${api.name}: best match = ${match?.url ?: "NONE"}")
-        if (match == null && results.isEmpty()) {
-
-            val homeItems = homePageItems(api)
-            Logger.log("TMDB_PLAY: ${api.name} home fallback -> ${homeItems.size} catalog items")
-            Log.i("TmdbDetails", "${api.name}: home fallback -> ${homeItems.size} catalog items")
-            match = bestSearchMatch(homeItems, d.displayTitle, wantMovie)
-            if (match != null) {
-                Logger.log("TMDB_PLAY: ${api.name} matched '${d.displayTitle}' from home page: '${match.name}'")
-            }
-        }
         if (match == null) {
             return ApiResolve(emptyList(), "${api.name}: no search result matched '${d.displayTitle}' (${results.size} results)")
         }
@@ -391,33 +535,6 @@ object TmdbStreamResolver {
     return x.contains(y) || y.contains(x)
     }
 
-    private suspend fun homePageItems(api: MainAPI): List<SearchResponse> {
-        val items = mutableListOf<SearchResponse>()
-        val pages = api.mainPage.filter { it.data.isNotBlank() }
-        if (pages.isEmpty()) {
-
-            val resp = runCatching {
-                api.getMainPage(1, MainPageRequest("Home", "", false))
-            }.getOrElse { t ->
-                if (t is kotlinx.coroutines.CancellationException) throw t
-                null
-            }
-            resp?.items?.forEach { items.addAll(it.list) }
-        } else {
-            for (page in pages) {
-                val resp = runCatching {
-                    api.getMainPage(1, MainPageRequest(page.name, page.data, page.horizontalImages))
-                }.getOrElse { t ->
-                    if (t is kotlinx.coroutines.CancellationException) throw t
-                    null
-                }
-                resp?.items?.forEach { items.addAll(it.list) }
-                if (items.isNotEmpty()) break
-            }
-        }
-        return items
-    }
-
     private fun drmForLink(link: ExtractorLink): DrmInfo? {
         val result = when (link) {
             is DrmExtractorLink -> {
@@ -459,7 +576,8 @@ object TmdbStreamResolver {
         val detail: TmdbDetail,
         val source: CsInstalledSource,
         val load: LoadResponse? = null,
-        val isLive: Boolean = load is LiveStreamLoadResponse
+        val isLive: Boolean = load is LiveStreamLoadResponse,
+        val stremioAddon: StremioAddon? = null,
     )
 
     private val episodeShells = mutableMapOf<String, Map<String, Episode>>()
@@ -489,6 +607,10 @@ object TmdbStreamResolver {
         loadResponseCache.keys.removeAll { it.startsWith("$mediaId|") }
     }
 
+    fun invalidateLinks(mediaId: Int, sourceName: String) {
+        linksCache.keys.removeAll { it.startsWith("$mediaId|$sourceName|") }
+    }
+
     private fun qualityFromLabel(label: String): Int? =
         Regex("\\d{3,4}").find(label)?.value?.toIntOrNull()
 
@@ -497,6 +619,50 @@ object TmdbStreamResolver {
         url.contains(".mpd", ignoreCase = true) -> VideoType.DASH
         else -> VideoType.CONTAINER
     }
+
+    fun stremioLinks(
+        streams: List<StremioStream>,
+        sourceName: String,
+    ): List<StreamResult.PlayableLink> = streams.mapNotNull { stream ->
+        val url = stream.url?.takeIf { it.isNotBlank() }
+        val external = stream.externalUrl?.takeIf { it.isNotBlank() }
+        val detailText = stream.description?.takeIf { it.isNotBlank() }
+            ?: stream.title?.takeIf { it.isNotBlank() }
+        val name = stream.name?.takeIf { it.isNotBlank() } ?: sourceName
+        val sameAsName = detailText?.trim()?.equals(name.trim(), ignoreCase = true) == true
+        val hint = detailText?.takeUnless { sameAsName }?.let { cleanStreamText(it) }
+        val labelHint = hint?.let {
+            if (it.length > 120) it.take(117).trimEnd() + "…" else it
+        }
+        when {
+            url != null -> StreamResult.PlayableLink(
+                label = if (labelHint.isNullOrBlank()) name else "$name · $labelHint",
+                url = url,
+                host = runCatching { java.net.URI(url).host }.getOrNull().orEmpty(),
+                details = hint,
+            )
+            external != null -> StreamResult.PlayableLink(
+                label = name,
+                url = "",
+                host = "External",
+                externalUrl = external,
+                details = hint,
+                rawDetails = detailText?.takeUnless { sameAsName }
+                    ?.replace('\u200b', ' ')
+                    ?.trim(),
+            )
+            hint != null -> StreamResult.PlayableLink(
+                label = name,
+                url = "",
+                host = "External",
+                details = hint,
+            )
+            else -> null
+        }
+    }
+
+    private fun cleanStreamText(text: String): String =
+        text.replace('\u200b', ' ').replace(Regex("\\s+"), " ").trim()
 
     private fun audioLanguage(audio: AudioFile): String {
         val hay = audio.url.lowercase()
@@ -684,8 +850,13 @@ object TmdbStreamResolver {
             val season = ep.extra?.get("season")?.toIntOrNull()
             val episodeNum = ep.extra?.get("episode")?.toIntOrNull()
             val cached = cachedLinks(session.mediaId, session.source.name, season, episodeNum)
-            val result = cached
-                ?: if (session.load != null) {
+            val stremioAddon = session.stremioAddon
+            val result = (cached
+                ?: if (stremioAddon != null) {
+                    (resolveStremio(stremioAddon, session.mediaType, session.mediaId, session.detail, season, episodeNum)
+                        as? StreamResult.Success)
+                        ?.also { cacheLinks(session.mediaId, session.source.name, season, episodeNum, it) }
+                } else if (session.load != null) {
                     (resolvePluginStreams(context, session.source, session.load, season, episodeNum)
                         as? StreamResult.Success)
                         .also { if (it != null) cacheLinks(session.mediaId, session.source.name, season, episodeNum, it) }
@@ -693,7 +864,7 @@ object TmdbStreamResolver {
                     (resolveStreams(context, session.source, session.detail, season, episodeNum)
                         as? StreamResult.Success)
                         .also { if (it != null) cacheLinks(session.mediaId, session.source.name, season, episodeNum, it) }
-                }
+                })
                 ?: return@withContext false
             val extractors = buildExtractors(result.links)
             if (extractors.isEmpty()) return@withContext false
@@ -718,10 +889,11 @@ object TmdbStreamResolver {
         links: List<StreamResult.PlayableLink>,
         pickedLabel: String,
         episodesOverride: Map<String, Episode>? = null,
-        load: LoadResponse? = null
-    ) {
+        load: LoadResponse? = null,
+        stremioAddon: StremioAddon? = null,
+    ): Boolean {
         val id = syntheticId(mediaId)
-        sessions[id] = SyntheticSession(mediaId, mediaType, d, source, load)
+        sessions[id] = SyntheticSession(mediaId, mediaType, d, source, load, stremioAddon = stremioAddon)
         if (sessions.size > 24) {
             sessions.entries.take(sessions.size - 24).forEach { sessions.remove(it.key) }
         }
@@ -729,9 +901,9 @@ object TmdbStreamResolver {
         val currentKey = if (mediaType == "tv") {
             episodeKey(season ?: 1, epNumber ?: 1)
         } else "1"
-        val current = episodes[currentKey] ?: episodes.values.firstOrNull() ?: return
+        val current = episodes[currentKey] ?: episodes.values.firstOrNull() ?: return false
         val extractors = buildExtractors(links)
-        if (extractors.isEmpty()) return
+        if (extractors.isEmpty()) return false
         current.extractors = extractors.toMutableList()
         current.extractorsSource = 0
         current.allStreams = true
@@ -784,12 +956,18 @@ object TmdbStreamResolver {
             "TMDB_PLAY: launching ExoplayerView for ${mediaType} id=$id title='$title' " +
                 "eps=${episodes.size} current='$currentKey' picked='$pickedLabel'"
         )
-        ExoplayerView.media = media
-        ExoplayerView.initialized = true
-        context.startActivity(
-            Intent(context, ExoplayerView::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        )
-        return
+        withContext(Dispatchers.Main.immediate) {
+            ExoplayerView.media = media
+            ExoplayerView.initialized = true
+            context.startActivity(
+                Intent(context, ExoplayerView::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+            (context as? android.app.Activity)?.overridePendingTransition(
+                android.R.anim.fade_in,
+                android.R.anim.fade_out,
+            )
+        }
+        return true
     }
 }

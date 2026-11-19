@@ -53,6 +53,7 @@ import ani.sanin.util.GlassEffectManager
 import ani.sanin.databinding.ActivityMainBinding
 import ani.sanin.databinding.DialogUserAgentBinding
 import ani.sanin.cloudstream.CsRepos
+import ani.sanin.cloudstream.CsRuntime
 import ani.sanin.home.AnimeFragment
 import ani.sanin.home.DiscoveryFragment
 import ani.sanin.home.HomeFragment
@@ -71,6 +72,7 @@ import ani.sanin.settings.AddRepositoryBottomSheet
 import ani.sanin.settings.MediaTrackerBottomSheet
 import ani.sanin.settings.ExtensionsActivity
 import ani.sanin.settings.FirstTimeProviderDialog
+import ani.sanin.settings.StremioAddonManager
 import ani.sanin.settings.saving.PrefManager
 import ani.sanin.settings.saving.PrefManager.asLiveBool
 import ani.sanin.settings.saving.PrefName
@@ -379,11 +381,8 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            var startTab = PrefManager.getVal<Int>(PrefName.DefaultStartUpTab)
-            if (startTab > 1) {
-                startTab = 0
-                PrefManager.setVal(PrefName.DefaultStartUpTab, 0)
-            }
+            val startTab = PrefManager.getVal<Int>(PrefName.DefaultStartUpTab)
+                .coerceIn(0, tabFragments.size - 1)
             navPillsViewModel.setTab(startTab)
             switchTab(startTab)
 
@@ -685,8 +684,12 @@ class MainActivity : AppCompatActivity() {
             "Anime"
         } else {
             val src = PrefManager.getVal<String>(PrefName.ContentSource)
-            if (src == "simkl" || src == "tmdb") "Simkl"
-            else CsRepos.installed(this).firstOrNull { it.id == src }?.name ?: "Movie & TV"
+            if (src == CsRuntime.ALL_SOURCES_ID) "All"
+            else if (src == "simkl" || src == "tmdb") "Simkl"
+            else StremioAddonManager.addonForSourceId(src)?.manifest?.name
+                ?: CsRuntime.cachedApiName(src)
+                ?: CsRepos.installed(this).firstOrNull { it.id == CsRuntime.pluginIdOf(src) }?.name
+                ?: "Movie & TV"
         }
         binding.mainModeText.text = text
     }

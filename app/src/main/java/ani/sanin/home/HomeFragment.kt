@@ -76,6 +76,7 @@ import ani.sanin.openLinkInBrowser
 import ani.sanin.profile.ProfileActivity
 import ani.sanin.px
 import ani.sanin.setSafeOnClickListener
+import ani.sanin.ui.LensButtonBackground
 import ani.sanin.util.FocusEffectUtil
 import ani.sanin.setSlideIn
 import ani.sanin.setSlideUp
@@ -86,6 +87,7 @@ import ani.sanin.settings.saving.PrefManager.asLiveBool
 import ani.sanin.settings.saving.PrefName
 import ani.sanin.snackString
 import ani.sanin.bannerCardSizePx
+import ani.sanin.classicBannerHeightPx
 import ani.sanin.sizeBannerCard
 import ani.sanin.statusBarHeight
 import ani.sanin.tryWithSuspend
@@ -115,6 +117,7 @@ class HomeFragment : Fragment() {
     private var homeBannerLogos: Map<Int, String?> = emptyMap()
 
     private var catalogueMode = false
+    private var appliedSectionsVersion = -1
 
     private var catalogueJob: Job? = null
     private var catalogueBannerJob: Job? = null
@@ -140,6 +143,7 @@ class HomeFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         val scope = lifecycleScope
         catalogueMode = AnimeCatalogueHome.isCatalogueSource(AnimeCatalogueHome.savedSourceId())
+        appliedSectionsVersion = PrefManager.getVal<Int>(PrefName.HomeSectionsAnimeVersion)
         loggedOutMode = !catalogueMode && isTrackerLoggedOut()
         Logger.log("HomeFragment: catalogueMode=$catalogueMode loggedOut=$loggedOutMode source='${AnimeCatalogueHome.savedSourceId()}'")
         fun load() {
@@ -1019,6 +1023,7 @@ class HomeFragment : Fragment() {
     private val bannerSnapHelper = PagerSnapHelper()
     private var bannerAutoScrollHandler: Handler? = null
     private var bannerAutoScrollRunnable: Runnable? = null
+    private val bannerOverlayDebounceHandler = Handler(Looper.getMainLooper())
 
     private fun setupBannerCarousel() {
         applyHomeBannerLandscapeMode()
@@ -1080,24 +1085,27 @@ class HomeFragment : Fragment() {
                                 val pos = lm.getPosition(child)
                                 if (pos == RecyclerView.NO_POSITION || homeBannerItems.isEmpty()) return
                                 val cardW = child.width
-                                val stripW = overlay.width - cardW / 4
-                                if (cardW <= 0 || stripW <= 0) return
+                                if (cardW <= 0) return
                                 val progress = (-child.left).toFloat() / cardW
                                 val real = pos % homeBannerItems.size
                                 val target = if (progress < 0.5f) real else (real + 1) % homeBannerItems.size
                                 if (target != lastTarget) {
                                     lastTarget = target
-                                    updateHomeBannerOverlay(homeBannerItems[target])
+                                    bannerOverlayDebounceHandler.removeCallbacksAndMessages(null)
+                                    bannerOverlayDebounceHandler.postDelayed(
+                                        Runnable { updateHomeBannerOverlay(homeBannerItems[target]) },
+                                        160L
+                                    )
                                 }
-                                val scale = stripW.toFloat() / cardW
-                                overlay.translationX =
-                                    (if (progress < 0.5f) child.left else child.left + cardW) * scale
                             }
 
                             override fun onScrollStateChanged(rv: RecyclerView, newState: Int) {
                                 if (newState == RecyclerView.SCROLL_STATE_IDLE) {
                                     lastTarget = -1
+                                    bannerOverlayDebounceHandler.removeCallbacksAndMessages(null)
                                     binding.homeBannerOverlay.translationX = 0f
+                                    binding.homeBannerOverlay.animate().cancel()
+                                    binding.homeBannerOverlay.alpha = 1f
                                     updateHomeBannerOverlayForCurrent()
                                 }
                             }
@@ -1266,7 +1274,6 @@ class HomeFragment : Fragment() {
         btnLp.gravity = if (classic) Gravity.CENTER_HORIZONTAL else Gravity.NO_GRAVITY
         btn.layoutParams = btnLp
         if (classic) {
-            btn.setBackgroundResource(R.drawable.banner_classic_pill_bg)
             btn.minWidth = 0
             btn.minHeight = 0
             btn.minimumHeight = res.getDimensionPixelSize(R.dimen.banner_classic_watch_height)
@@ -1285,7 +1292,6 @@ class HomeFragment : Fragment() {
             btn.gravity = Gravity.CENTER
             btn.setAllCaps(false)
         } else {
-            btn.setBackgroundResource(R.drawable.tag_chip_bg)
             btn.gravity = Gravity.CENTER
             btn.setPadding(
                 (20 * density).toInt(), (8 * density).toInt(),
@@ -1296,6 +1302,13 @@ class HomeFragment : Fragment() {
                 ctx.getThemeColor(com.google.android.material.R.attr.colorOnBackground)
             )
         }
+        val navWatchRadiusPx = (if (classic) 18f else 12f) * density
+        LensButtonBackground.apply(
+            btn,
+            tint = LensButtonBackground.WATCH_TINT,
+            cornerRadiusPx = navWatchRadiusPx,
+        )
+        FocusEffectUtil.applyFocusListener(btn, cornerRadiusPx = navWatchRadiusPx)
     }
 
     private fun navBannerChipsLabels(media: Media): List<String> {
@@ -1449,7 +1462,14 @@ class HomeFragment : Fragment() {
                 else -> false
             }
         }
-        FocusEffectUtil.applyFocusListener(btn)
+        val density = btn.resources.displayMetrics.density
+        val watchRadiusPx = 12f * density
+        LensButtonBackground.apply(
+            btn,
+            tint = LensButtonBackground.WATCH_TINT,
+            cornerRadiusPx = watchRadiusPx,
+        )
+        FocusEffectUtil.applyFocusListener(btn, cornerRadiusPx = watchRadiusPx)
         btn.nextFocusUpId = R.id.mainCalendarContainer
         btn.nextFocusDownId = homeBannerDownTarget()
     }
@@ -1631,6 +1651,8 @@ class HomeFragment : Fragment() {
 
         overlay.isVisible = !fullBleed
         if (!fullBleed) {
+            overlay.animate().cancel()
+            overlay.alpha = 1f
             overlay.updateLayoutParams<ViewGroup.MarginLayoutParams> {
                 width = stripW + cardW / 4
                 height = cardH
@@ -1638,6 +1660,7 @@ class HomeFragment : Fragment() {
             overlay.setPadding(sidePad, 0, sidePad, 0)
             b.homeBannerOverlayLogo.maxWidth = (stripW - sidePad * 2).coerceAtLeast(1)
             b.homeBannerOverlayLogo.maxHeight = (cardH * 0.30f).toInt()
+            b.homeBannerOverlaySynopsis.post { fitHomeBannerSynopsis() }
             b.homeBannerOverlaySynopsis.updateLayoutParams<ViewGroup.MarginLayoutParams> {
                 width = (stripW - sidePad * 2 + cardW / 4).coerceAtLeast(1)
             }
@@ -1724,6 +1747,18 @@ class HomeFragment : Fragment() {
         } else {
             synopsis.isVisible = false
         }
+    }
+
+    private fun fitHomeBannerSynopsis() {
+        val b = _binding ?: return
+        fitPanelSynopsis(
+            b.homeBannerOverlay,
+            b.homeBannerOverlaySynopsis,
+            floorLines = 1,
+            reservedGapDp = 30,
+            reservedGapCount = 1,
+            hideWhenNoRoom = true,
+        )
     }
 
     private fun addHomeOverlayChip(container: LinearLayout, text: String?) {
@@ -1833,7 +1868,7 @@ class HomeFragment : Fragment() {
             AnimeCatalogueHome.displayMedia(sourceId, it)
         }
         if (bannerItems.isNotEmpty()) {
-            val banner = RecyclerView(ctx).apply {
+            val banner = BannerCrossfadeRecyclerView(ctx).apply {
                 layoutManager = LinearLayoutManager(ctx, LinearLayoutManager.HORIZONTAL, false)
                 isNestedScrollingEnabled = false
                 overScrollMode = View.OVER_SCROLL_NEVER
@@ -1973,18 +2008,30 @@ class HomeFragment : Fragment() {
                         if (anime.season.isNullOrBlank()) anime.season = aniListMedia?.anime?.season
                         if (anime.seasonYear == null) anime.seasonYear = aniListMedia?.anime?.seasonYear
                     }
-                    anilistId?.let { media.id to it }
+                    anilistId?.let { Triple(media.id, it, tmdb) }
                       }
                     } }.awaitAll().filterNotNull()
                 }
-                val logoIdsByMedia = resolvedIds.toMap()
+                val logoIdsByMedia = resolvedIds.associate { it.first to it.second }
+                val tmdbByMedia = resolvedIds.mapNotNull { result ->
+                    result.third?.let { result.first to it }
+                }.toMap()
                 val backdropUrls = bannerItems.associate { it.id to it.banner }
                 val logos = runCatching {
                     LogoApi.getLogosBatch(logoIdsByMedia.values.toList())
                 }.getOrDefault(emptyMap())
-                val displayLogos = logoIdsByMedia.mapNotNull { (mediaId, apiId) ->
-                    logos[apiId]?.let { mediaId to it }
-                }.toMap()
+                val displayLogos = coroutineScope {
+                    val gate = Semaphore(4)
+                    logoIdsByMedia.map { (mediaId, apiId) -> async(Dispatchers.IO) {
+                        gate.withPermit {
+                            val fanartLogo = logos[apiId]
+                            val logo = fanartLogo ?: tmdbByMedia[mediaId]?.let { tmdb ->
+                                runCatching { Tmdb.logoUrl(tmdb.type, tmdb.id) }.getOrNull()
+                            }
+                            logo?.let { mediaId to it }
+                        }
+                    } }.awaitAll().filterNotNull().toMap()
+                }
                 withContext(Dispatchers.Main) {
                     if (_binding != null && banner.adapter != null) {
                         (banner.adapter as? BannerCarouselAdapter)?.updateUrls(backdropUrls, displayLogos)
@@ -2052,7 +2099,7 @@ class HomeFragment : Fragment() {
 
     private fun catalogueBannerHeight(): Int = when {
         isModernBanner() -> resources.getDimensionPixelSize(R.dimen.banner_modern_height)
-        isClassicBanner() -> resources.getDimensionPixelSize(R.dimen.banner_classic_height)
+        isClassicBanner() -> resources.classicBannerHeightPx()
         else -> (resources.displayMetrics.widthPixels * 9f / 16f).toInt()
     }
 
@@ -2079,6 +2126,11 @@ class HomeFragment : Fragment() {
                 loadCatalogue()
             }
             return
+        }
+        val sectionsVersion = PrefManager.getVal<Int>(PrefName.HomeSectionsAnimeVersion)
+        if (sectionsVersion != appliedSectionsVersion) {
+            appliedSectionsVersion = sectionsVersion
+            Refresh.activity[1]?.postValue(true)
         }
         if (!model.loaded) Refresh.activity[1]!!.postValue(true)
         reapplyHomeLayout()
@@ -2132,6 +2184,7 @@ class HomeFragment : Fragment() {
         loggedOutRowRecyclers.clear()
         loggedOutItemFocusListeners.clear()
         bannerAutoScrollHandler?.removeCallbacksAndMessages(null)
+        bannerOverlayDebounceHandler.removeCallbacksAndMessages(null)
         bannerSnapHelper.attachToRecyclerView(null)
         homeLoading = false
         _binding = null
